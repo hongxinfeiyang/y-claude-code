@@ -1,0 +1,27 @@
+{
+    "name": "@y-claude-code/cli",
+    "version": "0.1.0",
+    "description": "终端 CLI — AI 编程助手命令行交互入口",
+    "type": "module",
+    "bin": {
+        "y-claude-code": "./dist/index.js"
+    },
+    "main": "./dist/index.js",
+    "scripts": {
+        "build": "tsup src/index.ts --format esm --dts --clean",
+        "start": "node dist/index.js",
+        "dev": "tsup src/index.ts --format esm --dts --watch",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run"
+    },
+    "dependencies": {
+        "@y-claude-code/core": "workspace:*",
+        "@y-claude-code/sandbox": "workspace:*"
+    },
+    "devDependencies": {
+        "@types/node": "^25.9.1",
+        "tsup": "^8.3.0",
+        "typescript": "^5.6.0",
+        "vitest": "^2.1.0"
+    }
+}

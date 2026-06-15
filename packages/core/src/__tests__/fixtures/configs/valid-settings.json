@@ -1,0 +1,12 @@
+{
+  "model": "claude-sonnet-4-6",
+  "provider": "anthropic",
+  "maxToolRounds": 20,
+  "maxTokensPerTurn": 8000,
+  "permissions": {
+    "defaultMode": "ask",
+    "rules": [
+      { "tool": "Bash", "mode": "ask" }
+    ]
+  }
+}

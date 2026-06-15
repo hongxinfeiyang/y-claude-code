@@ -1,0 +1,184 @@
+{
+    "name": "@y-claude-code/vscode",
+    "version": "0.1.0",
+    "displayName": "y-claude-code",
+    "description": "VS Code 插件 — IDE 内联 AI 编程助手",
+    "publisher": "y-claude-code",
+    "license": "MIT",
+    "categories": [
+        "Chat",
+        "Programming Languages",
+        "Machine Learning"
+    ],
+    "keywords": [
+        "ai",
+        "claude",
+        "copilot",
+        "chat",
+        "completion"
+    ],
+    "icon": "icon.png",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "activationEvents": [
+        "onView:y-claude-code.chat",
+        "onLanguage:typescript",
+        "onLanguage:javascript",
+        "onLanguage:python",
+        "onLanguage:go",
+        "onLanguage:rust",
+        "onLanguage:java"
+    ],
+    "main": "./dist/extension.js",
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "y-claude-code",
+                    "title": "y-claude-code",
+                    "icon": "$(hubot)"
+                }
+            ]
+        },
+        "views": {
+            "y-claude-code": [
+                {
+                    "type": "webview",
+                    "id": "y-claude-code.chat",
+                    "name": "聊天"
+                }
+            ]
+        },
+        "commands": [
+            {
+                "command": "y-claude-code.openChat",
+                "title": "打开 y-claude-code 聊天"
+            },
+            {
+                "command": "y-claude-code.toggleCompletion",
+                "title": "切换内联补全"
+            },
+            {
+                "command": "y-claude-code.explainSelection",
+                "title": "y-claude-code: 解释选中代码"
+            },
+            {
+                "command": "y-claude-code.reviewFile",
+                "title": "y-claude-code: 审查当前文件"
+            },
+            {
+                "command": "y-claude-code.processMessage",
+                "title": "Process Message"
+            },
+            {
+                "command": "y-claude-code.provideCompletion",
+                "title": "Provide Completion"
+            },
+            {
+                "command": "y-claude-code.applyEdit",
+                "title": "y-claude-code: 应用编辑"
+            },
+            {
+                "command": "y-claude-code.showDiff",
+                "title": "y-claude-code: 显示差异"
+            }
+        ],
+        "menus": {
+            "editor/context": [
+                {
+                    "command": "y-claude-code.explainSelection",
+                    "when": "editorHasSelection",
+                    "group": "y-claude-code@1"
+                },
+                {
+                    "command": "y-claude-code.reviewFile",
+                    "group": "y-claude-code@2"
+                }
+            ],
+            "commandPalette": [
+                {
+                    "command": "y-claude-code.explainSelection",
+                    "when": "editorHasSelection"
+                },
+                {
+                    "command": "y-claude-code.reviewFile",
+                    "when": "editorIsOpen"
+                }
+            ]
+        },
+        "keybindings": [
+            {
+                "command": "y-claude-code.openChat",
+                "key": "ctrl+shift+l",
+                "mac": "cmd+shift+l"
+            },
+            {
+                "command": "y-claude-code.explainSelection",
+                "key": "ctrl+shift+e",
+                "mac": "cmd+shift+e",
+                "when": "editorHasSelection"
+            }
+        ],
+        "configuration": {
+            "title": "y-claude-code",
+            "properties": {
+                "y-claude-code.provider": {
+                    "type": "string",
+                    "default": "anthropic",
+                    "enum": [
+                        "anthropic",
+                        "openai",
+                        "deepseek"
+                    ],
+                    "description": "LLM Provider"
+                },
+                "y-claude-code.model": {
+                    "type": "string",
+                    "default": "claude-sonnet-4-6",
+                    "description": "使用的模型"
+                },
+                "y-claude-code.apiKey": {
+                    "type": "string",
+                    "default": "",
+                    "description": "API Key (留空使用环境变量)"
+                },
+                "y-claude-code.baseURL": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Base URL (留空使用默认值)"
+                },
+                "y-claude-code.maxToolRounds": {
+                    "type": "number",
+                    "default": 20,
+                    "description": "最大工具调用轮数"
+                },
+                "y-claude-code.enableInlineCompletion": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "启用内联代码补全"
+                },
+                "y-claude-code.showThinking": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "显示 Thinking 过程"
+                }
+            }
+        }
+    },
+    "scripts": {
+        "build": "tsup src/extension.ts --format cjs --external vscode --clean",
+        "dev": "tsup src/extension.ts --format cjs --external vscode --watch",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "@y-claude-code/core": "workspace:*"
+    },
+    "devDependencies": {
+        "@types/node": "^25.9.1",
+        "@types/vscode": "^1.85.0",
+        "tsup": "^8.3.0",
+        "typescript": "^5.6.0",
+        "vitest": "^2.1.0"
+    }
+}
