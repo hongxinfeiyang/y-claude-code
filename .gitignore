@@ -1,0 +1,39 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+*.tsbuildinfo
+
+# 测试
+coverage/
+
+# 环境变量 & 密钥
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+
+# 本地配置（不入库）
+.y-claude/
+
+# IDE
+.vscode
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 系统
+Thumbs.db
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp

@@ -1,0 +1,23 @@
+{
+    "name": "y-claude-code",
+    "version": "0.1.0",
+    "private": true,
+    "description": "类 Claude Code 的 AI 编程助手",
+    "scripts": {
+        "build": "pnpm -r build",
+        "start": "pnpm --filter @y-claude-code/cli start",
+        "dev": "pnpm -r dev",
+        "test": "vitest",
+        "test:coverage": "vitest run --coverage",
+        "typecheck": "pnpm -r typecheck",
+        "lint": "eslint packages --ext .ts,.tsx",
+        "format": "prettier --write 'packages/**/*.{ts,tsx,json}'",
+        "format:check": "prettier --check 'packages/**/*.{ts,tsx,json}'"
+    },
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "devDependencies": {
+        "vitest": "^2.1.9"
+    }
+}
