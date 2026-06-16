@@ -39,7 +39,7 @@ import { PlanModeManager } from "./plan-mode-manager";
 import { MiddlewarePipeline } from "./middleware";
 import { ContextCompactor } from "./context-compactor";
 import { LLMCallManager } from "./llm-call-manager";
-import { ToolExecutor } from "./tool-executor";
+import { ToolExecutor, ToolExecutorState } from "./tool-executor";
 
 // ─── 默认常量 ───
 
@@ -59,7 +59,7 @@ const CJK_CHARS_PER_TOKEN = 1.5;
  *          减少空值检查，使核心依赖和服务依赖分离清晰。
  */
 export interface AgentServices {
-    errorRecovery?: ErrorRecoveryManager;
+    errorRecoveryManager?: ErrorRecoveryManager;
     observability?: ObservabilityManager;
     summarizer?: Summarizer;
     cacheManager?: CacheManager;
@@ -312,7 +312,7 @@ export class AgentLoop {
 
         this.messages = this.buildInitialMessages(userInput, config);
 
-        const traceId = (loopCtx.services?.observability ?? loopCtx.observability)?.startTurn(userInput) ?? "";
+        const traceId = this.svc<ObservabilityManager>(loopCtx, "observability")?.startTurn(userInput) ?? "";
         const signal = loopCtx.signal ?? new AbortController().signal;
 
         // ─── ReAct 主循环 ───
@@ -320,7 +320,7 @@ export class AgentLoop {
             // 用户中断检测
             if (signal.aborted) {
                 this.setState(AgentState.DONE, "用户中断 (signal.aborted)");
-                (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+                this.svc<ObservabilityManager>(loopCtx, "observability")?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
             }
@@ -331,13 +331,13 @@ export class AgentLoop {
 
             // 无工具调用 → 自然结束
             if (thinkResult.toolUses.length === 0) {
-                const alert = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor)?.getAlert();
+                const alert = this.svc<ContextMonitor>(loopCtx, "contextMonitor")?.getAlert();
                 if (alert) {
-                    const status = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor)!.getStatus();
+                    const status = this.svc<ContextMonitor>(loopCtx, "contextMonitor")!.getStatus();
                     yield { type: "context_alert", health: status.health, message: alert, usagePercent: status.usagePercent };
                 }
                 this.setState(AgentState.DONE, "无工具调用，自然结束");
-                (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+                this.svc<ObservabilityManager>(loopCtx, "observability")?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
             }
@@ -374,7 +374,7 @@ export class AgentLoop {
             error: new Error(`达到最大工具调用轮次 (${config.maxToolRounds})，对话已终止`),
         };
         this.setState(AgentState.DONE, "达到最大工具调用轮次");
-        (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+        this.svc<ObservabilityManager>(loopCtx, "observability")?.endTurn(traceId, this.tokenUsage, this.toolRounds);
         yield { type: "done", usage: this.tokenUsage };
     }
 
@@ -401,25 +401,42 @@ export class AgentLoop {
         this.proactiveContextCheck(config, loopCtx);
         this.setState(AgentState.THINKING, "LLM 推理开始");
 
-        const llmSpanId = (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMCall(
+        const obs = this.svc<ObservabilityManager>(loopCtx, "observability");
+        const llmSpanId = obs?.recordLLMCall(
             config.model, this.messages.length, this.tokenUsage.inputTokens,
         ) ?? "";
 
         try {
-            const activeTools = this.planModeManager.filterTools(config.tools);
+            // ─── 中间件: beforeLLMCall ───
+            let effectiveConfig = config;
+            const modifiedConfig = await this.middleware.runBeforeLLMCall(config);
+            if (modifiedConfig !== config) {
+                effectiveConfig = modifiedConfig;
+                // 中间件可能修改了 provider/model 等，同步回 config 引用
+                (config as { provider: typeof config.provider }).provider = modifiedConfig.provider;
+            }
+
+            const activeTools = this.planModeManager.filterTools(effectiveConfig.tools);
 
             const result = yield* this.llmCallManager.streamCall(this.messages, {
-                provider: config.provider,
-                model: config.model,
-                maxTokensPerTurn: config.maxTokensPerTurn,
-                thinkingEnabled: config.thinkingEnabled,
-                thinkingTokens: config.thinkingTokens,
+                provider: effectiveConfig.provider,
+                model: effectiveConfig.model,
+                maxTokensPerTurn: effectiveConfig.maxTokensPerTurn,
+                thinkingEnabled: effectiveConfig.thinkingEnabled,
+                thinkingTokens: effectiveConfig.thinkingTokens,
                 signal,
                 activeTools,
-                errorRecoveryManager: (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager),
-                cacheManager: (loopCtx.services?.cacheManager ?? loopCtx.cacheManager),
-                contextMonitor: (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor),
+                errorRecoveryManager: this.svc<ErrorRecoveryManager>(loopCtx, "errorRecoveryManager"),
+                cacheManager: this.svc<CacheManager>(loopCtx, "cacheManager"),
+                contextMonitor: this.svc<ContextMonitor>(loopCtx, "contextMonitor"),
             }, this.tokenUsage);
+
+            // ─── 中间件: afterLLMCall — 过滤/修改 tool_use 列表 ───
+            let toolUses = result.toolUses;
+            const filtered = await this.middleware.runAfterLLMCall(toolUses);
+            if (filtered !== toolUses) {
+                toolUses = filtered;
+            }
 
             // 流式 error chunk 恢复
             if (result.hasError) {
@@ -428,24 +445,24 @@ export class AgentLoop {
                     config, loopCtx, "LLM error chunk",
                 );
                 if (recoveryResult === "abort") {
-                    (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, result.toolUses.length, true, result.errorCategory);
+                    obs?.recordLLMResult(llmSpanId, this.tokenUsage, toolUses.length, true, result.errorCategory);
                     return { exit: true, toolUses: [] };
                 }
                 return { exit: false, toolUses: [] };
             }
 
             this.llmRecoveryCount = 0;
-            (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, result.toolUses.length, false);
-            return { exit: false, toolUses: result.toolUses };
+            obs?.recordLLMResult(llmSpanId, this.tokenUsage, toolUses.length, false);
+            return { exit: false, toolUses };
         } catch (error) {
             const err = error instanceof Error ? error : new Error(String(error));
-            (loopCtx.services?.observability ?? loopCtx.observability)?.recordError(err, ErrorCategory.NETWORK);
+            obs?.recordError(err, ErrorCategory.NETWORK);
 
             const recoveryResult = yield* this.handleLLMRecovery(
                 err, config, loopCtx, "LLM 调用异常",
             );
             if (recoveryResult === "abort") {
-                (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, 0, true, ErrorCategory.NETWORK);
+                obs?.recordLLMResult(llmSpanId, this.tokenUsage, 0, true, ErrorCategory.NETWORK);
                 return { exit: true, toolUses: [] };
             }
             return { exit: false, toolUses: [] };
@@ -469,23 +486,29 @@ export class AgentLoop {
         const result = yield* this.toolExecutor.executeAll(toolUses, {
             tools: config.tools,
             permissionManager: loopCtx.permissionManager,
-            errorRecoveryManager: (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager),
-            observability: (loopCtx.services?.observability ?? loopCtx.observability),
+            errorRecoveryManager: this.svc<ErrorRecoveryManager>(loopCtx, "errorRecoveryManager"),
+            observability: this.svc<ObservabilityManager>(loopCtx, "observability"),
             planModeManager: this.planModeManager,
             workingDirectory: loopCtx.workingDirectory,
             sessionId: loopCtx.sessionId,
             appendMessage: loopCtx.appendMessage,
-            sandbox: (loopCtx.services?.sandbox ?? loopCtx.sandbox),
+            sandbox: this.svc<ISandbox>(loopCtx, "sandbox"),
             logger: loopCtx.logger,
             signal,
+            middleware: this.middleware,
         },
             (s) => {
-                if (s === "WAITING_APPROVAL") this.setState(AgentState.WAITING_APPROVAL, "等待用户审批");
-                else if (s === "EXECUTING") this.setState(AgentState.EXECUTING, "开始执行工具");
+                if (s === ToolExecutorState.WAITING_APPROVAL) this.setState(AgentState.WAITING_APPROVAL, "等待用户审批");
+                else if (s === ToolExecutorState.EXECUTING) this.setState(AgentState.EXECUTING, "开始执行工具");
             },
             (isError) => {
-                if (isError) this.consecutiveErrors++;
-                else this.consecutiveErrors = 0;
+                if (isError) {
+                    this.consecutiveErrors++;
+                    console.log(`[AgentLoop] 工具错误 #${this.consecutiveErrors}`);
+                } else {
+                    if (this.consecutiveErrors > 0) console.log(`[AgentLoop] 工具成功, consecutiveErrors 重置`);
+                    this.consecutiveErrors = 0;
+                }
             },
         );
 
@@ -537,6 +560,8 @@ export class AgentLoop {
         });
 
         this.toolRounds++;
+        // ─── 中间件: afterRound — 统计/告警 ───
+        await this.middleware.runAfterRound(this.toolRounds, toolResults);
         return true;
     }
 
@@ -555,7 +580,7 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
         source: string,
     ): AsyncGenerator<TurnEvent, "continue" | "abort"> {
-        const erManager = (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager);
+        const erManager = this.svc<ErrorRecoveryManager>(loopCtx, "errorRecoveryManager");
         if (!erManager) {
             yield { type: "error", error: new Error(`${source}: ${error.message}`) };
             this.setState(AgentState.ERROR, "无可用的错误恢复管理器");
@@ -582,7 +607,7 @@ export class AgentLoop {
         const recovery = erManager.handleLLMError(error, config.model);
 
         if (recovery.action === "retry" && recovery.success) {
-            (loopCtx.services?.observability ?? loopCtx.observability)?.recordRecovery(recovery.strategy, true);
+            this.svc<ObservabilityManager>(loopCtx, "observability")?.recordRecovery(recovery.strategy, true);
             this.setState(AgentState.RECOVERING, `恢复中: ${recovery.strategy}`);
             yield {
                 type: "recovering",
@@ -594,7 +619,7 @@ export class AgentLoop {
                 (config as { provider: typeof config.provider }).provider = recovery.provider;
             }
             if (recovery.strategy === RecoveryStrategy.COMPACT_CONTEXT) {
-                this.messages = this.compactor.compact(this.messages, (loopCtx.services?.summarizer ?? loopCtx.summarizer));
+                this.messages = this.compactor.compact(this.messages, this.svc<Summarizer>(loopCtx, "summarizer"));
                 this.llmRecoveryCount = 0;
             }
             return "continue";
@@ -606,6 +631,13 @@ export class AgentLoop {
         return "abort";
     }
 
+    // ─── 辅助: 服务解析 (消除 services?.xxx ?? loopCtx.xxx 重复) ───
+
+    /** 解析可选服务：优先 services 子对象，回退顶层字段 */
+    private svc<T>(loopCtx: AgentLoopContext, key: keyof AgentServices): T | undefined {
+        return (loopCtx.services?.[key] ?? loopCtx[key as keyof AgentLoopContext]) as T | undefined;
+    }
+
     // ─── 辅助: 主动上下文检查 ───
 
     /**
@@ -615,7 +647,7 @@ export class AgentLoop {
      *          这样可以把压缩的 token 成本从"错误恢复"变成"正常流程"。
      */
     private proactiveContextCheck(config: AgentConfig, loopCtx: AgentLoopContext): void {
-        const monitor = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor);
+        const monitor = this.svc<ContextMonitor>(loopCtx, "contextMonitor");
         if (!monitor) return;
 
         const status = monitor.getStatus();
@@ -624,7 +656,7 @@ export class AgentLoop {
             loopCtx.logger?.warn(
                 `[AgentLoop] 上下文使用率 ${status.usagePercent.toFixed(1)}%，触发主动压缩`,
             );
-            this.messages = this.compactor.compact(this.messages, (loopCtx.services?.summarizer ?? loopCtx.summarizer));
+            this.messages = this.compactor.compact(this.messages, this.svc<Summarizer>(loopCtx, "summarizer"));
         }
     }
 

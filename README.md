@@ -5,12 +5,12 @@ AI 编程助手工具集 — 终端 CLI 与 VS Code IDE 插件双形态，可扩
 ## 架构
 
 ```text
-用户输入 → IntentRouter(意图路由) → Agent Loop(ReAct) → LLM Provider → 工具执行 → 输出
+用户输入 → IntentRouter(意图路由) → Agent Loop(编排层, 775 行) → LLM Provider → 工具执行 → 输出
                 │                       │
           内置命令/直接工具    Permission / Hook / Memory / Session
                 │                       │
-          22 个内置命令          Plan Mode / ErrorRecovery / Summarizer
-                                    │
+          22 个内置命令          子模块: PlanModeManager / LLMCallManager
+                                    │    ToolExecutor / MiddlewarePipeline
        ┌────────────────────────────┼────────────────────────────┐
        │                            │                            │
   CLI 终端渲染               Observability            VS Code Webview
@@ -235,6 +235,7 @@ packages/
 | [08-01-代码质量修复](docs/08-01-代码质量修复记录.md) | 8 个代码质量问题的分析与修复 |
 | [08-02-架构重构](docs/08-02-架构重构记录.md) | 7 个架构问题的分析与修复 |
 | [08-03-架构优化补充](docs/08-03-架构优化补充记录.md) | services 迁移、LLMCallManager、ToolExecutor |
+| [08-04-代码集成修复](docs/08-04-代码集成修复记录.md) | 中间件集成、状态枚举、DRY 消除、AbortSignal |
 
 ## 与 Claude Code 对比
 
@@ -254,6 +255,8 @@ packages/
 | **可观测性** | JSONL Transcript + Metrics + Tracing | 原生支持 |
 | **自动更新** | npm registry 检查 | 原生支持 |
 | **安全防护** | Prompt Injection + SSRF + 命令注入 + 输出脱敏 | 原生内置 |
+| **中间件** | 5 个生命周期钩子 (beforeLLMCall / afterLLMCall / beforeToolExecution / afterToolExecution / afterRound) | 无 |
+| **架构设计** | 5 个子模块拆分 (PlanModeManager / LLMCallManager / ToolExecutor / MiddlewarePipeline / ContextCompactor) | — |
 
 > 详细功能差距见 [07-功能差距与待办事项](docs/07-功能差距与待办事项.md)
 

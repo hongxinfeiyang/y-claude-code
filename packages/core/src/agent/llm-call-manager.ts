@@ -99,6 +99,8 @@ export class LLMCallManager {
         // 为什么区分 5 种 chunk 类型: LLM Provider 异步流中可能夹杂 text、
         // thinking、tool_use、stop、error 五种 chunk，需要分别处理。
         for await (const chunk of chunks) {
+            // 用户中断检测 — 每个 chunk 后检查，及时响应 Ctrl+C
+            if (ctx.signal.aborted) break;
             switch (chunk.type) {
                 case "text":
                     // 文本增量 — 直接透传给 UI 层实时展示

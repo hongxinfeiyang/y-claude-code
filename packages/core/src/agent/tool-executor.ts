@@ -14,6 +14,19 @@ import type { ErrorRecoveryManager } from "./error-recovery/manager";
 import { RecoveryStrategy } from "./error-recovery/types";
 import type { ObservabilityManager } from "../observability/manager";
 import { PlanModeManager } from "./plan-mode-manager";
+import type { MiddlewarePipeline } from "./middleware";
+
+/**
+ * ToolExecutorState — 工具执行过程中的状态枚举
+ * 解决问题: 消除 onStateChange 回调中的字符串硬编码 ("WAITING_APPROVAL" / "EXECUTING")，
+ *          提供类型安全的状态传递。
+ */
+export enum ToolExecutorState {
+    /** 等待用户审批工具调用 */
+    WAITING_APPROVAL = "waiting_approval",
+    /** 正在执行工具 */
+    EXECUTING = "executing",
+}
 
 /**
  * ToolExecutorContext — 工具执行管道所需的全部运行时依赖
@@ -43,6 +56,8 @@ export interface ToolExecutorContext {
     logger?: Logger;
     /** 取消信号 */
     signal: AbortSignal;
+    /** 中间件管道（可选） — 在每个工具执行前后调用 */
+    middleware?: MiddlewarePipeline;
 }
 
 export class ToolExecutor {
@@ -59,20 +74,39 @@ export class ToolExecutor {
      *
      * @param toolUses - LLM 返回的工具调用列表
      * @param ctx - 运行时依赖
-     * @param onStateChange - 状态变更回调（"WAITING_APPROVAL" / "EXECUTING"）
+     * @param onStateChange - 状态变更回调
      * @param onConsecutiveError - 连续错误回调（true=发生错误, false=执行成功）
      * @returns { toolResults, abort } — abort 为 true 表示熔断触发需终止 Agent 循环
      */
     async *executeAll(
         toolUses: ToolUse[],
         ctx: ToolExecutorContext,
-        onStateChange: (state: string) => void,
+        onStateChange: (state: ToolExecutorState) => void,
         onConsecutiveError: (isError: boolean) => void,
     ): AsyncGenerator<TurnEvent, { toolResults: ToolResult[]; abort: boolean }> {
         const toolResults: ToolResult[] = [];
 
         for (const toolUse of toolUses) {
+            // 用户中断检测 — 每个工具执行前检查
+            if (ctx.signal.aborted) {
+                break;
+            }
+
             yield { type: "tool_call", tool: toolUse };
+
+            // ─── 中间件: beforeToolExecution ───
+            if (ctx.middleware) {
+                const mwResult = await ctx.middleware.runBeforeToolExecution(toolUse);
+                if (mwResult.blocked) {
+                    toolResults.push({
+                        tool_use_id: toolUse.id,
+                        content: mwResult.reason ?? "操作被中间件阻止",
+                        is_error: true,
+                    });
+                    onConsecutiveError(true);
+                    continue;
+                }
+            }
 
             // ─── 可观测性: 记录工具调用 Span ───
             const toolSpanId = ctx.observability?.recordToolCall(
@@ -115,7 +149,7 @@ export class ToolExecutor {
             //   check 是异步的（可能弹窗等待用户输入），两者分离避免重复匹配。
             if (tool.requiresApproval(toolUse.input)) {
                 if (ctx.permissionManager.willPromptUser(toolUse)) {
-                    onStateChange("WAITING_APPROVAL");
+                    onStateChange(ToolExecutorState.WAITING_APPROVAL);
                     yield { type: "approval_request", tool: toolUse };
                 }
 
@@ -156,22 +190,26 @@ export class ToolExecutor {
                 signal: ctx.signal,
             };
 
-            onStateChange("EXECUTING");
+            onStateChange(ToolExecutorState.EXECUTING);
             try {
                 const result = await tool.execute(toolUse.input, toolCtx);
-                // 软提醒注入: 闸门返回了提醒信息但未阻止执行时，
-                // 将提醒前置到工具结果中，LLM 在下一轮可以看到。
-                const finalResult = gateResult.message
+                // 软提醒注入
+                let finalResult = gateResult.message
                     ? { ...result, content: `[规划提醒] ${gateResult.message}\n${result.content}` }
                     : result;
+
+                // ─── 中间件: afterToolExecution — 结果脱敏/审计 ───
+                if (ctx.middleware) {
+                    finalResult = await ctx.middleware.runAfterToolExecution(toolUse, finalResult);
+                }
+
                 toolResults.push({ ...finalResult, tool_use_id: toolUse.id });
                 onConsecutiveError(false);
-                // 执行成功 → 通知熔断器（重置窗口内失败计数）
                 ctx.errorRecoveryManager?.recordToolSuccess(toolUse.name);
-                yield { type: "tool_result", result };
+                yield { type: "tool_result", result: finalResult };
                 ctx.observability?.recordToolResult(
                     toolSpanId, toolUse.name, false,
-                    typeof result.content === "string" ? result.content : JSON.stringify(result.content),
+                    typeof finalResult.content === "string" ? finalResult.content : JSON.stringify(finalResult.content),
                 );
             } catch (error) {
                 // ─── 步骤 6: 错误处理 ───
