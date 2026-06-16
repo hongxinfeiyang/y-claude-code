@@ -196,6 +196,12 @@ export interface AgentConfig {
      * - "hard": 硬模式（无计划拒绝所有修改，计划漂移 3 次后强制重规划）
      */
     planningEnforcement?: "off" | "soft" | "hard";
+
+    /**
+     * 上下文压缩阈值 (0-100)，默认 85
+     * 当上下文使用率超过此百分比时主动触发压缩
+     */
+    contextCompressThreshold?: number;
 }
 
 // ─── 回合事件 ───

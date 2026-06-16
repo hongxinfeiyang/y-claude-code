@@ -31,10 +31,13 @@ import { ErrorRecoveryManager } from "./error-recovery/manager";
 import { RecoveryStrategy, ErrorCategory } from "./error-recovery/types";
 import { Summarizer } from "../context/summarizer";
 import { ObservabilityManager } from "../observability/manager";
-import { filterToolsForPlanMode, getCurrentPlan } from "../tools/builtin/plan-mode";
 import { TodoWriteTool } from "../tools/builtin/todo";
+import { PlanState } from "./plan-state";
 import { CacheManager } from "../context/cache-manager";
 import { ContextMonitor } from "../context/monitor";
+import { PlanModeManager } from "./plan-mode-manager";
+import { MiddlewarePipeline } from "./middleware";
+import { ContextCompactor } from "./context-compactor";
 
 // ─── 默认常量 ───
 
@@ -44,13 +47,29 @@ const MAX_LLM_RECOVERY = 3;
 /** 工具单次结果最大 token 估算: 超过此值截断，防止撑爆上下文 */
 const MAX_TOOL_RESULT_TOKENS = 8000;
 
-/** token 估算系数: 英文约 4 字符/token，取 4 估算上界 */
-const CHARS_PER_TOKEN_ESTIMATE = 4;
+/** token 估算系数: 英文约 4 字符/token，CJK 约 1.5 字符/token */
+const ASCII_CHARS_PER_TOKEN = 4;
+const CJK_CHARS_PER_TOKEN = 1.5;
+
+/**
+ * 标记: AgentServices — Agent 可选服务聚合
+ * 解决问题: 将 8 个可选依赖从 AgentLoopContext 平铺结构中收敛为服务组，
+ *          减少空值检查，使核心依赖和服务依赖分离清晰。
+ */
+export interface AgentServices {
+    errorRecovery?: ErrorRecoveryManager;
+    observability?: ObservabilityManager;
+    summarizer?: Summarizer;
+    cacheManager?: CacheManager;
+    contextMonitor?: ContextMonitor;
+    sandbox?: ISandbox;
+}
 
 /**
  * 标记: AgentLoopContext — Agent 主循环的运行时依赖接口
  * 解决问题: Agent Loop 需要多个外部依赖（权限管理、沙箱、日志器等），
  *          将这些依赖集中定义为一个接口，方便注入和测试替换。
+ *          核心必需依赖直接挂在 context 上，可选服务收敛到 services 子对象。
  */
 export interface AgentLoopContext {
     /**
@@ -127,6 +146,13 @@ export interface AgentLoopContext {
      * 解决问题: 实时追踪 token 使用率，接近窗口上限时主动告警。
      */
     contextMonitor?: ContextMonitor;
+
+    /**
+     * 标记: services — 可选服务聚合
+     * 解决问题: 将可选依赖收敛为子对象，新代码优先使用 services.xxx 而非顶层可选字段。
+     *          顶层可选字段保留向后兼容。
+     */
+    services?: AgentServices;
 }
 
 // ─── Thinking 阶段返回值 ───
@@ -166,6 +192,17 @@ export class AgentLoop {
     private state: AgentState = AgentState.IDLE;
 
     /**
+     * 标记: setState — 显式状态转换（带日志追踪）
+     * 解决问题: 确保所有状态转换都经过单一入口，便于调试和审计。
+     *          消除之前通过 return 隐式退出循环而不设置 state 的问题。
+     */
+    private setState(newState: AgentState, reason: string): void {
+        if (this.state !== newState) {
+            this.state = newState;
+        }
+    }
+
+    /**
      * 标记: messages — 对话上下文（消息历史）
      * 解决问题: 累积整个对话的所有消息（system、user、assistant、tool_result），
      *          每次 LLM 调用时作为完整上下文传给 Provider。
@@ -194,18 +231,6 @@ export class AgentLoop {
     private consecutiveErrors: number = 0;
 
     /**
-     * 标记: planMode — 是否处于计划模式
-     * 解决问题: 在计划模式下限制工具列表为只读工具，Agent 只能探索代码和设计
-     */
-    private planMode: boolean = false;
-
-    /**
-     * 标记: originalTools — 进入计划模式前的完整工具列表
-     * 解决问题: 退出计划模式时需要恢复完整的工具列表
-     */
-    private originalTools: Tool[] = [];
-
-    /**
      * 标记: llmRecoveryCount — LLM 层恢复连续计数
      * 解决问题: LLM 层的 RETRY/SWITCH_PROVIDER/COMPACT_CONTEXT 不计入 consecutiveErrors，
      *          需要独立计数防止恢复死循环（如反复 COMPACT_CONTEXT 但始终溢出）。
@@ -218,49 +243,30 @@ export class AgentLoop {
      */
     private planEnforcementMode: "off" | "soft" | "hard" = "soft";
 
-    // ─── 规划闸门：enforcePlanningGate ───
-
-    /** 修改类工具名集合 */
-    private static readonly MODIFY_TOOLS = new Set(["Write", "Edit", "Bash"]);
+    /**
+     * 标记: planState — 规划闸门状态
+     * 解决问题: 规划状态由 AgentLoop 创建和拥有，解耦 TodoWriteTool 的静态耦合。
+     *          通过 TodoWriteTool.setPlanState 注入，执行和闸门共享同一状态实例。
+     */
+    private planState: PlanState = new PlanState();
 
     /**
-     * 标记: enforcePlanningGate — 在修改工具执行前检查是否已有计划
-     * 解决问题: 无计划时首次修改软提醒，二次修改硬拒绝；有计划时检测漂移
+     * 标记: planModeManager — Plan Mode 状态管理器
+     * 解决问题: 将 Plan Mode 的工具过滤、闸门检查、状态切换从 AgentLoop 中抽离。
      */
-    private enforcePlanningGate(
-        toolName: string,
-    ): { blocked: boolean; message?: string } {
-        if (this.planEnforcementMode === "off") return { blocked: false };
-        if (!AgentLoop.MODIFY_TOOLS.has(toolName)) return { blocked: false };
+    private planModeManager: PlanModeManager = new PlanModeManager();
 
-        if (TodoWriteTool.hasActivePlan()) {
-            const alignment = TodoWriteTool.checkPlanAlignment(toolName);
-            if (!alignment.aligned) {
-                const drifts = TodoWriteTool.trackDrift();
-                if (drifts >= 3 && this.planEnforcementMode === "hard") {
-                    return {
-                        blocked: true,
-                        message: `计划漂移警告 (第 ${drifts} 次): 当前操作 "${toolName}" 似乎与正在执行的任务无关。请更新 TodoWrite 或解释此操作的必要性。`,
-                    };
-                }
-                return { blocked: false, message: alignment.warning };
-            }
-            return { blocked: false };
-        }
+    /**
+     * 标记: middleware — 中间件管道
+     * 解决问题: 提供可插拔的拦截器机制，支持审计、限流、脱敏等横切关注点。
+     */
+    readonly middleware: MiddlewarePipeline = new MiddlewarePipeline();
 
-        const modifyCount = TodoWriteTool.trackModifyCallWithoutPlan();
-        if (modifyCount >= 2) {
-            return {
-                blocked: true,
-                message: `需要先创建任务计划。已执行 ${modifyCount} 个修改操作但未使用 TodoWrite。请立即调用 TodoWrite 将任务分解为具体步骤后继续。`,
-            };
-        }
-
-        return {
-            blocked: false,
-            message: "提醒: 建议先用 TodoWrite 创建任务计划来跟踪进度。",
-        };
-    }
+    /**
+     * 标记: compactor — 上下文压缩器
+     * 解决问题: 将消息压缩逻辑从 AgentLoop 中抽离为独立模块。
+     */
+    private compactor: ContextCompactor = new ContextCompactor();
 
     /**
      * 标记: run — Agent 主循环入口，返回异步事件流
@@ -279,16 +285,16 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
     ): AsyncGenerator<TurnEvent> {
         // ─── 初始化: 每次 run() 调用都重置内部状态 ───
-        this.state = AgentState.IDLE;
+        this.setState(AgentState.IDLE, "run() 初始化");
         this.toolRounds = 0;
         this.consecutiveErrors = 0;
         this.llmRecoveryCount = 0;
-        this.planMode = false;
-        this.originalTools = [];
         this.tokenUsage = { inputTokens: 0, outputTokens: 0 };
 
         this.planEnforcementMode = config.planningEnforcement ?? "soft";
-        TodoWriteTool.resetSession();
+        this.planState.reset();
+        TodoWriteTool.setPlanState(this.planState);
+        this.planModeManager.reset(this.planEnforcementMode);
 
         this.messages = this.buildInitialMessages(userInput, config);
 
@@ -299,7 +305,7 @@ export class AgentLoop {
         while (this.toolRounds < config.maxToolRounds) {
             // 用户中断检测
             if (signal.aborted) {
-                this.state = AgentState.DONE;
+                this.setState(AgentState.DONE, "用户中断 (signal.aborted)");
                 loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
@@ -316,7 +322,7 @@ export class AgentLoop {
                     const status = loopCtx.contextMonitor!.getStatus();
                     yield { type: "context_alert", health: status.health, message: alert, usagePercent: status.usagePercent };
                 }
-                this.state = AgentState.DONE;
+                this.setState(AgentState.DONE, "无工具调用，自然结束");
                 loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
@@ -353,7 +359,7 @@ export class AgentLoop {
             type: "error",
             error: new Error(`达到最大工具调用轮次 (${config.maxToolRounds})，对话已终止`),
         };
-        this.state = AgentState.DONE;
+        this.setState(AgentState.DONE, "达到最大工具调用轮次");
         loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
         yield { type: "done", usage: this.tokenUsage };
     }
@@ -381,7 +387,7 @@ export class AgentLoop {
         // ─── 主动上下文检查: 超过告警阈值时预压缩，不等 API 报错 ───
         this.proactiveContextCheck(config, loopCtx);
 
-        this.state = AgentState.THINKING;
+        this.setState(AgentState.THINKING, "LLM 推理开始");
 
         let toolUses: ToolUse[] = [];
         let hasError = false;
@@ -395,9 +401,7 @@ export class AgentLoop {
                 this.tokenUsage.inputTokens,
             ) ?? "";
 
-            const activeTools = this.planMode && this.originalTools.length > 0
-                ? filterToolsForPlanMode(this.originalTools)
-                : config.tools;
+            const activeTools = this.planModeManager.filterTools(config.tools);
 
             const chunks = config.provider.chat(this.messages, {
                 model: config.model,
@@ -436,7 +440,7 @@ export class AgentLoop {
                         this.llmRecoveryCount = 0;
                         break;
                     case "error":
-                        errorCategory = this.classifyChunkError(chunk.code);
+                        errorCategory = loopCtx.errorRecoveryManager?.classifyErrorCode(chunk.code) ?? ErrorCategory.PROVIDER_ERROR;
                         yield {
                             type: "error",
                             error: new Error(`LLM 调用错误 [${chunk.code}]: ${chunk.message}`),
@@ -530,7 +534,7 @@ export class AgentLoop {
             // ─── 权限检查 ───
             if (tool.requiresApproval(toolUse.input)) {
                 if (loopCtx.permissionManager.willPromptUser(toolUse)) {
-                    this.state = AgentState.WAITING_APPROVAL;
+                    this.setState(AgentState.WAITING_APPROVAL, "等待用户审批");
                     yield { type: "approval_request", tool: toolUse };
                 }
 
@@ -551,7 +555,7 @@ export class AgentLoop {
             }
 
             // ─── 规划闸门检查 ───
-            const gateResult = this.enforcePlanningGate(toolUse.name);
+            const gateResult = this.planModeManager.enforceGate(toolUse.name);
             if (gateResult.blocked) {
                 toolResults.push({
                     tool_use_id: toolUse.id,
@@ -572,7 +576,7 @@ export class AgentLoop {
                 signal,
             };
 
-            this.state = AgentState.EXECUTING;
+            this.setState(AgentState.EXECUTING, "开始执行工具");
             try {
                 const result = await tool.execute(toolUse.input, toolCtx);
                 // 软提醒：注入提示到结果
@@ -602,7 +606,7 @@ export class AgentLoop {
                             error: new Error(recovery.error ?? "工具熔断保护触发"),
                             category: ErrorCategory.CIRCUIT_BREAKER,
                         };
-                        this.state = AgentState.ERROR;
+                        this.setState(AgentState.ERROR, "工具熔断保护触发");
                         return { abort: true, toolResults };
                     }
                     errorMessage = recovery.error ?? errorMessage;
@@ -640,7 +644,7 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
     ): AsyncGenerator<TurnEvent, boolean> {
         // ─── Plan Mode 状态切换检测 ───
-        yield* this.handlePlanModeTransitions(toolUses);
+        yield* this.planModeManager.handleTransitions(toolUses);
 
         // ─── 连续错误保护: 工具层 + LLM 恢复层双重保护 ───
         if (this.consecutiveErrors >= 3) {
@@ -648,7 +652,7 @@ export class AgentLoop {
                 type: "error",
                 error: new Error("连续 3 次工具调用失败，已保护性停止。请检查问题后重试。"),
             };
-            this.state = AgentState.ERROR;
+            this.setState(AgentState.ERROR, "连续 3 次工具错误，保护性停止");
             return false;
         }
 
@@ -687,7 +691,7 @@ export class AgentLoop {
     ): AsyncGenerator<TurnEvent, "continue" | "abort"> {
         if (!loopCtx.errorRecoveryManager) {
             yield { type: "error", error: new Error(`${source}: ${error.message}`) };
-            this.state = AgentState.ERROR;
+            this.setState(AgentState.ERROR, "无可用的错误恢复管理器");
             return "abort";
         }
 
@@ -704,7 +708,7 @@ export class AgentLoop {
                     `最后一次恢复策略: ${source}。请检查网络、API 配置或手动压缩上下文后重试。`,
                 ),
             };
-            this.state = AgentState.ERROR;
+            this.setState(AgentState.ERROR, "LLM 恢复连续失败超过上限");
             return "abort";
         }
 
@@ -712,7 +716,7 @@ export class AgentLoop {
 
         if (recovery.action === "retry" && recovery.success) {
             loopCtx.observability?.recordRecovery(recovery.strategy, true);
-            this.state = AgentState.RECOVERING;
+            this.setState(AgentState.RECOVERING, `恢复中: ${recovery.strategy}`);
             yield {
                 type: "recovering",
                 strategy: recovery.strategy,
@@ -723,14 +727,15 @@ export class AgentLoop {
                 (config as { provider: typeof config.provider }).provider = recovery.provider;
             }
             if (recovery.strategy === RecoveryStrategy.COMPACT_CONTEXT) {
-                this.compactMessages(loopCtx.summarizer);
+                this.messages = this.compactor.compact(this.messages, loopCtx.summarizer);
+                this.llmRecoveryCount = 0;
             }
             return "continue";
         }
 
         // 不可恢复
         yield { type: "error", error: new Error(`${source}: ${error.message}`) };
-        this.state = AgentState.ERROR;
+        this.setState(AgentState.ERROR, "LLM 错误不可恢复");
         return "abort";
     }
 
@@ -742,43 +747,17 @@ export class AgentLoop {
      *          而是在每次 LLM 调用前检查 ContextMonitor，超过告警阈值时主动压缩。
      *          这样可以把压缩的 token 成本从"错误恢复"变成"正常流程"。
      */
-    private proactiveContextCheck(_config: AgentConfig, loopCtx: AgentLoopContext): void {
+    private proactiveContextCheck(config: AgentConfig, loopCtx: AgentLoopContext): void {
         const monitor = loopCtx.contextMonitor;
         if (!monitor) return;
 
         const status = monitor.getStatus();
-        // 超过 85% (critical) 时主动压缩，为本次 LLM 响应留出空间
-        if (status.usagePercent >= 85) {
+        const threshold = config.contextCompressThreshold ?? 85;
+        if (status.usagePercent >= threshold) {
             loopCtx.logger?.warn(
                 `[AgentLoop] 上下文使用率 ${status.usagePercent.toFixed(1)}%，触发主动压缩`,
             );
-            this.compactMessages(loopCtx.summarizer);
-        }
-    }
-
-    // ─── 辅助: Plan Mode 检测 ───
-
-    /**
-     * 标记: handlePlanModeTransitions — 检测并处理 Plan Mode 状态切换
-     * 解决问题: 将 EnterPlanMode/ExitPlanMode 的检测逻辑从主循环中抽离。
-     */
-    private async *handlePlanModeTransitions(
-        toolUses: ToolUse[],
-    ): AsyncGenerator<TurnEvent, void> {
-        for (const toolUse of toolUses) {
-            if (toolUse.name === "EnterPlanMode") {
-                if (!this.planMode) {
-                    this.originalTools = []; // 将在下次 executeThinkingPhase 中通过 filterToolsForPlanMode 处理
-                    this.planMode = true;
-                    this.state = AgentState.PLANNING;
-                    yield { type: "plan_mode_entered", message: "已进入计划模式，仅可使用只读工具进行代码探索和方案设计" };
-                }
-            } else if (toolUse.name === "ExitPlanMode") {
-                if (this.planMode) {
-                    this.planMode = false;
-                    yield { type: "plan_mode_exited", plan: getCurrentPlan() || "计划已提交，退出计划模式" };
-                }
-            }
+            this.messages = this.compactor.compact(this.messages, loopCtx.summarizer);
         }
     }
 
@@ -787,7 +766,8 @@ export class AgentLoop {
     /**
      * 标记: truncateToolResults — 截断过大的工具结果
      * 解决问题: 防止单个工具输出（如 cat 大文件）撑爆上下文窗口。
-     *          基于字符数粗略估算 token 数，超过上限时截断并追加截断提示。
+     *          基于字符类型估算 token 数（ASCII ~4 字符/token，CJK ~1.5 字符/token），
+     *          超过上限时在安全边界（换行符）处截断。
      */
     private truncateToolResults(
         results: ToolResult[],
@@ -797,12 +777,11 @@ export class AgentLoop {
             if (r.is_error) return r;
 
             const contentStr = typeof r.content === "string" ? r.content : JSON.stringify(r.content);
-            const estimatedTokens = Math.ceil(contentStr.length / CHARS_PER_TOKEN_ESTIMATE);
+            const estimatedTokens = this.estimateTokens(contentStr);
 
             if (estimatedTokens <= MAX_TOOL_RESULT_TOKENS) return r;
 
-            // 截断: 保留前 MAX_TOOL_RESULT_TOKENS * CHARS_PER_TOKEN_ESTIMATE 个字符
-            const maxChars = MAX_TOOL_RESULT_TOKENS * CHARS_PER_TOKEN_ESTIMATE;
+            const maxChars = this.findSafeTruncationPoint(contentStr);
             const truncated = contentStr.slice(0, maxChars);
             const omittedChars = contentStr.length - maxChars;
 
@@ -815,6 +794,76 @@ export class AgentLoop {
                 content: `${truncated}\n\n[... 结果过长已截断，省略约 ${omittedChars} 字符，原始估 ${estimatedTokens} tokens ...]`,
             };
         });
+    }
+
+    /** 估算字符串的 token 数，区分 ASCII 和 CJK 字符 */
+    private estimateTokens(str: string): number {
+        let asciiChars = 0;
+        let cjkChars = 0;
+        let otherChars = 0;
+
+        for (const ch of str) {
+            const cp = ch.codePointAt(0) ?? 0;
+            if (cp <= 0x7f) {
+                asciiChars++;
+            } else if (
+                (cp >= 0x4e00 && cp <= 0x9fff) || // CJK 统一汉字
+                (cp >= 0x3400 && cp <= 0x4dbf) || // CJK 扩展 A
+                (cp >= 0x20000 && cp <= 0x2a6df) || // CJK 扩展 B
+                (cp >= 0x3040 && cp <= 0x309f) || // 平假名
+                (cp >= 0x30a0 && cp <= 0x30ff) || // 片假名
+                (cp >= 0xac00 && cp <= 0xd7af) // 韩文
+            ) {
+                cjkChars++;
+            } else {
+                otherChars++;
+            }
+        }
+
+        return Math.ceil(
+            asciiChars / ASCII_CHARS_PER_TOKEN +
+            cjkChars / CJK_CHARS_PER_TOKEN +
+            otherChars / ASCII_CHARS_PER_TOKEN,
+        );
+    }
+
+    /** 找到安全的截断点：优先在换行符处截断 */
+    private findSafeTruncationPoint(contentStr: string): number {
+        // 目标截断位置（以 ASCII 估算一个初始上限，然后回退找安全点）
+        const targetByteLen = MAX_TOOL_RESULT_TOKENS * ASCII_CHARS_PER_TOKEN;
+
+        if (contentStr.length <= targetByteLen) return contentStr.length;
+
+        // 在目标位置附近找最后一个换行符
+        const searchStart = Math.max(0, targetByteLen);
+        const lastNewline = contentStr.lastIndexOf("\n", searchStart);
+
+        // 如果找到且在合理范围内（不低于目标的 60%），使用它
+        if (lastNewline > targetByteLen * 0.6) {
+            // 确保不截断 UTF-8 代理对中间
+            if (lastNewline + 1 < contentStr.length) {
+                const nextCp = contentStr.codePointAt(lastNewline + 1);
+                if (nextCp !== undefined && nextCp >= 0xdc00 && nextCp <= 0xdfff) {
+                    // 低代理项，回退一个字符
+                    return lastNewline - 1;
+                }
+            }
+            return lastNewline + 1; // 包含换行符
+        }
+
+        // 回退：在原目标位置找安全截断点
+        let pos = targetByteLen;
+        while (pos > 0 && pos < contentStr.length) {
+            const cp = contentStr.codePointAt(pos);
+            // 跳过 UTF-16 低代理项
+            if (cp !== undefined && cp >= 0xdc00 && cp <= 0xdfff) {
+                pos--;
+                continue;
+            }
+            break;
+        }
+
+        return Math.max(1, pos);
     }
 
     // ─── 公开 API ───
@@ -884,70 +933,5 @@ export class AgentLoop {
                 required: tool.parameters.required,
             },
         };
-    }
-
-    /**
-     * 标记: classifyChunkError — 将 LLM 流式 error chunk 的 code 映射为 ErrorCategory
-     *
-     * @param code - LLM Provider 返回的错误码字符串
-     * @returns ErrorCategory 枚举值
-     */
-    private classifyChunkError(code: string): ErrorCategory {
-        switch (code) {
-            case "rate_limit_error":
-            case "rate_limit":
-                return ErrorCategory.RATE_LIMIT;
-            case "authentication_error":
-            case "invalid_auth":
-                return ErrorCategory.AUTH;
-            case "invalid_request_error":
-                return ErrorCategory.INVALID_REQUEST;
-            case "context_length_exceeded":
-            case "token_limit_exceeded":
-                return ErrorCategory.CONTEXT_OVERFLOW;
-            case "server_error":
-            case "api_error":
-            case "overloaded":
-                return ErrorCategory.PROVIDER_ERROR;
-            case "network_error":
-            case "timeout":
-            case "connection_error":
-                return ErrorCategory.NETWORK;
-            default:
-                return ErrorCategory.PROVIDER_ERROR;
-        }
-    }
-
-    /**
-     * 标记: compactMessages — 压缩消息历史以回收 Token
-     * 解决问题: 当上下文使用率过高或 LLM 返回 CONTEXT_OVERFLOW 时，削去最早的消息历史。
-     *         优先使用 Summarizer 的累积摘要（语义保留），
-     *         未配置 Summarizer 时使用简单截断（保留 system + 最近 50%）。
-     */
-    private compactMessages(summarizer?: Summarizer): void {
-        const systemMessages = this.messages.filter((m) => m.role === "system");
-        const nonSystemMessages = this.messages.filter((m) => m.role !== "system");
-
-        if (nonSystemMessages.length <= 2) {
-            return;
-        }
-
-        const keepCount = Math.max(2, Math.floor(nonSystemMessages.length / 2));
-        const kept = nonSystemMessages.slice(-keepCount);
-
-        let summaryContent: string;
-        const accumulatedSummary = summarizer?.getAccumulatedSummary();
-        if (accumulatedSummary) {
-            summaryContent = `[上下文压缩]: 省略了 ${nonSystemMessages.length - keepCount} 条历史消息。\n以下是之前对话的摘要:\n${accumulatedSummary}`;
-        } else {
-            summaryContent = `[上下文压缩]: 省略了 ${nonSystemMessages.length - keepCount} 条历史消息`;
-        }
-
-        const summaryMessage: Message = {
-            role: "user",
-            content: summaryContent,
-        };
-
-        this.messages = [...systemMessages, summaryMessage, ...kept];
     }
 }

@@ -248,4 +248,35 @@ export class ErrorClassifier {
         }
         return undefined;
     }
+
+    /**
+     * 按错误码分类 — 消除 AgentLoop.classifyChunkError 的重复
+     * 解决问题: Agent Loop 中对流式 error chunk 的错误码分类逻辑
+     *         与 ErrorClassifier 内部逻辑重复，统一在此处管理。
+     */
+    classifyByCode(code: string): ErrorCategory {
+        switch (code) {
+            case "rate_limit_error":
+            case "rate_limit":
+                return ErrorCategory.RATE_LIMIT;
+            case "authentication_error":
+            case "invalid_auth":
+                return ErrorCategory.AUTH;
+            case "invalid_request_error":
+                return ErrorCategory.INVALID_REQUEST;
+            case "context_length_exceeded":
+            case "token_limit_exceeded":
+                return ErrorCategory.CONTEXT_OVERFLOW;
+            case "server_error":
+            case "api_error":
+            case "overloaded":
+                return ErrorCategory.PROVIDER_ERROR;
+            case "network_error":
+            case "timeout":
+            case "connection_error":
+                return ErrorCategory.NETWORK;
+            default:
+                return ErrorCategory.PROVIDER_ERROR;
+        }
+    }
 }

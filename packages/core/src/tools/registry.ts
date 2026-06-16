@@ -16,9 +16,11 @@ import {
 export class ToolRegistry {
     private tools: Map<string, Tool> = new Map();
 
-    register(tool: Tool): void {
+    register(tool: Tool, options?: { replace?: boolean }): void {
         if (this.tools.has(tool.name)) {
-            throw new Error(`工具 "${tool.name}" 已注册，不允许重复注册`);
+            if (!options?.replace) {
+                throw new Error(`工具 "${tool.name}" 已注册，不允许重复注册`);
+            }
         }
         this.tools.set(tool.name, tool);
     }

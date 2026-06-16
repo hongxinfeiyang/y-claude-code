@@ -23,7 +23,7 @@ AI 编程助手工具集 — 终端 CLI 与 VS Code IDE 插件双形态，可扩
 
 | 包 | 说明 |
 | ---- | ------ |
-| `@y-claude-code/core` | Agent Loop、23 个内置工具、LLM 适配、权限、上下文摘要、可观测性 |
+| `@y-claude-code/core` | Agent Loop、23 个内置工具、LLM 适配、权限、上下文摘要、可观测性、中间件管道 |
 | `@y-claude-code/cli` | readline 交互、ANSI Markdown、权限记忆、22 个命令、环境诊断 |
 | `@y-claude-code/sandbox` | Docker 沙箱 — 命令隔离执行、安全策略、降级支持 |
 | `@y-claude-code/mcp` | MCP 协议 — JSON-RPC 客户端 + Tool 适配器 |
@@ -51,7 +51,7 @@ pnpm --filter @y-claude-code/cli dev
 
 ### 初次配置
 
-首次启动自动进入 LLM 配置向导。配置文件采用多级合并（后者覆盖前者）：
+首次启动自动进入 LLM 配置向导。配置文件采用多级合并（后者覆盖前者，嵌套对象深度合并）：
 
 | 优先级 | 路径 | 说明 |
 | ------ | ------ | ------ |
@@ -189,7 +189,7 @@ Agent 执行 Bash/Write/Edit 等操作前需要终端确认：
 packages/
 ├── core/src/
 │   ├── types/        # 消息、工具、Agent、配置、会话
-│   ├── agent/        # ReAct 主循环 + error-recovery/(重试/熔断/回退)
+│   ├── agent/        # ReAct 主循环 + PlanMode/中间件/压缩 + error-recovery/(重试/熔断/回退)
 │   ├── router/       # 意图识别 + 分发
 │   ├── llm/          # Anthropic / OpenAI Provider + Token 计数
 │   ├── tools/        # 23 个内置工具 + 注册中心
@@ -232,6 +232,8 @@ packages/
 | [05-开发手册](docs/05-开发手册.md) | 环境搭建、项目结构、添加工具/Provider、调试、发布 |
 | [06-测试手册](docs/06-测试手册.md) | 测试策略、覆盖率目标、CI 流水线、检查清单 |
 | [07-功能差距](docs/07-功能差距与待办事项.md) | 与 Claude Code 差距对比、已/待实现事项 |
+| [08-01-代码质量修复](docs/08-01-代码质量修复记录.md) | 8 个代码质量问题的分析与修复（规划闸门、Token 估算、Bash 权限、配置合并等） |
+| [08-02-架构重构](docs/08-02-架构重构记录.md) | 7 个架构问题的分析与修复（AgentLoop 拆分、中间件、状态机、PlanMode 等） |
 
 ## 与 Claude Code 对比
 

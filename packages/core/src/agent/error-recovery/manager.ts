@@ -225,6 +225,14 @@ export class ErrorRecoveryManager {
     }
 
     /**
+     * 错误码分类 — 统一入口，消除 AgentLoop 中的重复分类逻辑
+     * @param code - LLM Provider 返回的错误码字符串
+     */
+    classifyErrorCode(code: string): ErrorCategory {
+        return this.classifier.classifyByCode(code);
+    }
+
+    /**
      * 工具执行成功后通知熔断器
      * @param toolName - 工具名称
      */

@@ -54,7 +54,7 @@ Agent Loop      runtime.ts     Webview Panel
 
 - **环境变量**优先级高于文件：`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`Y_CLAUDE_CODE_MODEL`、`Y_CLAUDE_CODE_PROVIDER` 等
 - **settings.local.json** 覆盖 **settings.json**：允许开发者本地调整权限、MCP 等而不污染团队配置
-- 合并策略：嵌套对象（如 `providers`）浅合并，基础类型和数组直接覆盖
+- 合并策略：嵌套对象（如 `providers`）深度递归合并，基础类型和数组直接覆盖
 
 ### 配置项
 

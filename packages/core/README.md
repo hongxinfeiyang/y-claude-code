@@ -6,7 +6,7 @@
 
 | 模块 | 职责 |
 |------|------|
-| `agent/` | ReAct 主循环 (`loop.ts`) + 错误恢复（重试/熔断/Provider 回退链） |
+| `agent/` | ReAct 主循环 (`loop.ts`) + PlanMode 管理 + 中间件管道 + 上下文压缩 + 错误恢复（重试/熔断/Provider 回退链） |
 | `tools/builtin/` | 20 个内置工具：Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/Agent/AskUserQuestion/TodoWrite/NotebookEdit/EnterPlanMode/ExitPlanMode/EnterWorktree/ExitWorktree/TaskOutput/TaskStop/Skill/CronCreate/CronDelete/CronList/ScheduleWakeup |
 | `llm/` | Anthropic + OpenAI Provider，Token 计数，Provider 工厂 |
 | `context/` | 上下文构建、LLM 驱动渐进式摘要 (`summarizer.ts`)、Prompt Cache 管理、窗口监控 |
@@ -24,7 +24,7 @@
 
 | 文件 | 类型 |
 |------|------|
-| `types/agent.ts` | AgentConfig, AgentState, TurnEvent, AgentLoopContext |
+| `types/agent.ts` | AgentConfig, AgentState, TurnEvent, AgentLoopContext, AgentServices |
 | `types/messages.ts` | Message, ToolUse, ToolResult, ResponseChunk, TokenUsage |
 | `types/config.ts` | LLMProvider, PermissionRule, PermissionLevel |
 | `types/session.ts` | SessionData |

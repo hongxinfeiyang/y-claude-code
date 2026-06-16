@@ -5,6 +5,7 @@
 import { Tool } from "../../types/tools";
 import type { JSONSchema, ToolContext } from "../../types/tools";
 import type { ToolResult } from "../../types/messages";
+import { PlanState, PlanTodo } from "../../agent/plan-state";
 
 /**
  * TodoWriteTool — 任务列表管理工具
@@ -15,9 +16,8 @@ import type { ToolResult } from "../../types/messages";
  * - 用户需要了解剩余工作量
  *
  * 设计考量：
- * - 通过静态方法暴露当前 todos，供 CLI/UI 读取展示
- * - 任务状态三态：pending / in_progress / completed
- * - 限制同时只有一个 in_progress 任务
+ * - 规划状态通过 PlanState 对象管理，由 AgentLoop 注入
+ * - 保留静态方法兼容，当未注入 PlanState 时使用内部默认实例
  */
 export class TodoWriteTool extends Tool {
     name = "TodoWrite";
@@ -46,64 +46,61 @@ export class TodoWriteTool extends Tool {
         required: ["todos"],
     } as unknown as JSONSchema;
 
-    // 当前任务列表（静态，供 CLI 读取）
-    private static currentTodos: Array<{ content: string; status: string; activeForm: string }> = [];
+    /** 可注入的规划状态实例，未注入时使用内部默认实例 */
+    private static _planState: PlanState | null = null;
+    private static _defaultPlanState: PlanState = new PlanState();
 
-    // 强制执行状态
-    private static modifyCallsWithoutPlan = 0;
-    private static driftWarnings = 0;
+    private static get planState(): PlanState {
+        return TodoWriteTool._planState ?? TodoWriteTool._defaultPlanState;
+    }
+
+    /** 注入外部 PlanState（由 AgentLoop 在 run() 初始化时调用） */
+    static setPlanState(state: PlanState): void {
+        TodoWriteTool._planState = state;
+    }
+
+    /** 清除外部注入，回退到默认实例 */
+    static clearPlanState(): void {
+        TodoWriteTool._planState = null;
+    }
 
     static getTodos(): Array<{ content: string; status: string; activeForm: string }> {
-        return [...TodoWriteTool.currentTodos];
+        return [...TodoWriteTool.planState.todos];
     }
 
     /** AgentLoop 闸门：是否存在活跃计划 */
     static hasActivePlan(): boolean {
-        return TodoWriteTool.currentTodos.length > 0;
+        return TodoWriteTool.planState.hasActivePlan();
     }
 
     /** AgentLoop 闸门：递增无计划修改计数，返回当前计数 */
     static trackModifyCallWithoutPlan(): number {
-        TodoWriteTool.modifyCallsWithoutPlan++;
-        return TodoWriteTool.modifyCallsWithoutPlan;
+        return TodoWriteTool.planState.trackModifyCallWithoutPlan();
     }
 
     /** AgentLoop 闸门：检查工具调用是否与当前 in_progress 任务对齐 */
     static checkPlanAlignment(_toolName: string): { aligned: boolean; warning?: string } {
-        if (!TodoWriteTool.hasActivePlan()) return { aligned: true };
-        const active = TodoWriteTool.currentTodos.find((t) => t.status === "in_progress");
-        if (!active) return { aligned: true };
-        // 软性启发式：有 in_progress 即认为对齐（未来可做更细粒度匹配）
-        return { aligned: true };
+        return TodoWriteTool.planState.checkPlanAlignment(_toolName);
     }
 
     /** AgentLoop 闸门：递增漂移计数 */
     static trackDrift(): number {
-        TodoWriteTool.driftWarnings++;
-        return TodoWriteTool.driftWarnings;
+        return TodoWriteTool.planState.trackDrift();
     }
 
     /** AgentLoop 闸门：重置会话状态 */
     static resetSession(): void {
-        TodoWriteTool.currentTodos = [];
-        TodoWriteTool.modifyCallsWithoutPlan = 0;
-        TodoWriteTool.driftWarnings = 0;
+        TodoWriteTool.planState.reset();
     }
 
     /** 记忆持久化：序列化当前任务状态 */
     static toPersistenceJSON(): object {
-        return {
-            todos: TodoWriteTool.currentTodos,
-            modifyCallsWithoutPlan: TodoWriteTool.modifyCallsWithoutPlan,
-            driftWarnings: TodoWriteTool.driftWarnings,
-        };
+        return TodoWriteTool.planState.toPersistenceJSON();
     }
 
     /** 记忆持久化：从序列化数据恢复状态 */
     static fromPersistenceJSON(json: Record<string, unknown>): void {
-        TodoWriteTool.currentTodos = (json.todos as Array<{ content: string; status: string; activeForm: string }>) ?? [];
-        TodoWriteTool.modifyCallsWithoutPlan = (json.modifyCallsWithoutPlan as number) ?? 0;
-        TodoWriteTool.driftWarnings = (json.driftWarnings as number) ?? 0;
+        TodoWriteTool.planState.fromPersistenceJSON(json);
     }
 
     async execute(params: Record<string, unknown>, _context: ToolContext): Promise<ToolResult> {
@@ -123,7 +120,7 @@ export class TodoWriteTool extends Tool {
             };
         }
 
-        TodoWriteTool.currentTodos = todos;
+        TodoWriteTool.planState.todos = todos as PlanTodo[];
 
         // 格式化展示
         const statusIcons: Record<string, string> = { pending: " ", in_progress: "▸", completed: "✓" };

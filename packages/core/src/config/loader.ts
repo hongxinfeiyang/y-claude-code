@@ -236,14 +236,10 @@ export class ConfigLoader {
      * 深度合并配置对象（source 覆盖 target）
      *
      * 合并策略：
-     *   - 嵌套对象：浅合并（{...tgtVal, ...srcVal}），只合并一层
+     *   - 嵌套对象：递归深度合并
      *     例：providers 中的各个 Provider 配置是合并而非整体替换
      *   - 基础类型和数组：直接覆盖
      *   - undefined 值：不覆盖（保留 target 原值）
-     *
-     * 为什么嵌套对象只合并一层：
-     *   - 配置层级通常只有 2 层（如 config.providers.anthropic.apiKey）
-     *   - 简单递归即可满足需求，不需要 lodash.merge 等深度合并
      *
      * @param target — 目标配置对象（会被修改）
      * @param source — 来源配置（优先级更高）
@@ -253,15 +249,28 @@ export class ConfigLoader {
             const srcVal = source[key];
             const tgtVal = target[key];
             if (srcVal !== undefined) {
-                if (typeof srcVal === "object" && !Array.isArray(srcVal) && typeof tgtVal === "object" && !Array.isArray(tgtVal)) {
-                    // 嵌套对象：展开合并（保留 target 未覆盖的字段）
-                    const merged = { ...tgtVal, ...srcVal };
-                    console.log("[ConfigLoader] merge key:", key, "tgtVal keys:", Object.keys(tgtVal), "srcVal keys:", Object.keys(srcVal), "merged keys:", Object.keys(merged));
-                    (target[key] as Record<string, unknown>) = merged;
+                if (this.isPlainObject(srcVal) && this.isPlainObject(tgtVal)) {
+                    this.deepMerge(tgtVal as Record<string, unknown>, srcVal as Record<string, unknown>);
                 } else {
-                    // 基础类型（string/number/boolean）或数组：直接覆盖
-                    console.log("[ConfigLoader] merge key:", key, "type:", typeof srcVal, "值:", typeof srcVal === "string" ? srcVal : "(complex)");
                     target[key] = srcVal as never;
+                }
+            }
+        }
+    }
+
+    private isPlainObject(val: unknown): val is Record<string, unknown> {
+        return typeof val === "object" && val !== null && !Array.isArray(val);
+    }
+
+    private deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): void {
+        for (const key of Object.keys(source)) {
+            const srcVal = source[key];
+            const tgtVal = target[key];
+            if (srcVal !== undefined) {
+                if (this.isPlainObject(srcVal) && this.isPlainObject(tgtVal)) {
+                    this.deepMerge(tgtVal, srcVal);
+                } else {
+                    target[key] = srcVal;
                 }
             }
         }

@@ -19,6 +19,16 @@ import type { ToolUse } from "../types/messages";
 import type { PermissionRule } from "../types/config";
 
 /**
+ * 权限决策结果
+ * 解决问题: 统一 check() 和 willPromptUser() 的规则匹配逻辑，
+ *          消除两处重复的排序→匹配→判断代码。
+ */
+interface PermissionDecision {
+    action: "allow" | "deny" | "prompt";
+    fromCache: boolean;
+}
+
+/**
  * 权限级别定义
  *
  * 【标记是什么】
@@ -151,107 +161,22 @@ export class PermissionManager {
     }
 
     /**
-     * 检查工具调用是否需要用户允许 — PermissionManager 的核心方法
+     * 统一权限决策 — check() 和 willPromptUser() 的共享逻辑
      *
-     * 【标记是什么】
-     * 对一次工具调用进行完整的权限检查，返回布尔值表示是否允许执行。
-     *
-     * 【解决什么问题】
-     * 这是权限决策的主入口，所有工具调用（无论是 DIRECT_TOOL 路径还是
-     * Agent Loop 路径）在执行前都必须经过此方法审批。决策采用短路逻辑：
-     * 一旦某一步得出确定结论（允许/拒绝），立即返回，不继续后续检查。
-     *
-     * 决策流程（按优先级）：
-     * 1. Session 缓存 — 本会话中已明确允许/拒绝，直接返回（除非 forceRecheck）
-     * 2. 规则匹配   — 按 scope 排序（session > project > user > global），
-     *                 第一匹配规则决定结果
-     * 3. 默认策略   — 无规则匹配时的兜底行为
-     *
-     * @param toolUse       — 待检查的工具调用对象
-     * @param forceRecheck  — 是否强制重新检查（忽略 session 缓存）
-     * @returns true 表示允许执行，false 表示拒绝
+     * 解决问题: 消除两处规则排序、pattern 匹配、缓存检查的重复代码。
+     *          决策流程：缓存 → 规则匹配 → 默认策略。
      */
-    async check(toolUse: ToolUse, forceRecheck = false): Promise<boolean> {
-        // ─── 1. Session 缓存检查 ───
-        // 【解决什么问题】
-        // 用户在本会话中勾选了"本次会话全允许/全拒绝"某个操作时，
-        // 后续相同操作直接返回缓存结果，不再弹窗。
-        // forceRecheck 参数允许在配置变更等场景下绕过缓存重新检查。
+    private decide(toolUse: ToolUse, forceRecheck: boolean): PermissionDecision {
+        // 1. Session 缓存检查
         const cacheKey = this.buildCacheKey(toolUse);
         if (!forceRecheck && this.sessionCache.has(cacheKey)) {
-            return this.sessionCache.get(cacheKey) === "allow";
+            return {
+                action: this.sessionCache.get(cacheKey)!,
+                fromCache: true,
+            };
         }
 
-        // ─── 2. 按优先级匹配规则: session > project > user > global ───
-        // 【解决什么问题】
-        // 规则按作用域排序，优先级高的作用域优先匹配。
-        // session 规则（运行时动态添加）→ project 规则（.y-claude/settings.json）
-        // → user 规则（~/.y-claude/settings.json）→ global 规则（系统级）
-        // 这种排序确保"最近最具体的规则"优先生效。
-        const sortedRules = [...this.rules].sort((a, b) => {
-            const priority = { session: 0, project: 1, user: 2, global: 3 };
-            return (priority[a.scope] ?? 4) - (priority[b.scope] ?? 4);
-        });
-
-        for (const rule of sortedRules) {
-            // 检查工具名是否匹配规则中的 toolPattern
-            if (this.matchesPattern(toolUse.name, rule.toolPattern)) {
-                // ─── 对 Bash 工具的额外命令匹配 ───
-                // 【解决什么问题】
-                // Bash 工具的权限粒度需要细化到具体命令：
-                // 规则 "Bash" → "npm test" (allow) 只放行 npm test，
-                // 不影响 "Bash" → "rm -rf" 的检查逻辑。
-                // 如果规则定义了 commandPattern，必须同时匹配命令才生效。
-                if (rule.commandPattern && toolUse.input.command) {
-                    if (!this.matchesPattern(toolUse.input.command as string, rule.commandPattern)) {
-                        continue; // 命令不匹配，跳过此规则继续检查下一条
-                    }
-                }
-                // 规则命中后的三种处理方式
-                if (rule.action === "allow") return true;  // 明确允许
-                if (rule.action === "deny")  return false; // 明确拒绝
-                if (rule.action === "ask")   return this.promptUser(toolUse); // 弹窗确认
-            }
-        }
-
-        // ─── 3. 默认策略（所有规则都不匹配时）───
-        // 【解决什么问题】
-        // 当没有任何规则覆盖当前工具调用时的兜底行为。
-        // defaultMode 在构造函数中设置，默认为 "ask"（安全优先）。
-        switch (this.defaultMode) {
-            case "allow":
-                return true;
-            case "deny":
-                return false;
-            case "ask":
-            default:
-                return this.promptUser(toolUse);
-        }
-    }
-
-    /**
-     * 预检：判断工具调用是否会触发用户确认弹窗（同步、非阻塞）
-     *
-     * 【标记是什么】
-     * willPromptUser 是 check() 的"干跑版本" — 复用相同的规则匹配逻辑，
-     * 但不执行异步 promptUser()，仅返回是否需要用户交互。
-     *
-     * 【解决什么问题】
-     * Agent Loop 在执行工具前需要知道是否该展示"等待确认"提示。
-     * 对于被规则自动允许/拒绝的工具（如 WebSearch 命中 allow 规则），
-     * 直接执行即可，不应展示"⏳ 等待确认"造成用户困惑。
-     *
-     * 判断逻辑与 check() 完全一致，唯一的区别是遇到 "ask" 时不调 promptUser，
-     * 而是直接返回 true 表示"需要用户确认"。
-     *
-     * @returns true 表示需要用户确认（会弹窗），false 表示自动决定（允许或拒绝）
-     */
-    willPromptUser(toolUse: ToolUse): boolean {
-        const cacheKey = this.buildCacheKey(toolUse);
-        if (this.sessionCache.has(cacheKey)) {
-            return false; // 已有缓存决策，不会弹窗
-        }
-
+        // 2. 按优先级匹配规则: session > project > user > global
         const sortedRules = [...this.rules].sort((a, b) => {
             const priority = { session: 0, project: 1, user: 2, global: 3 };
             return (priority[a.scope] ?? 4) - (priority[b.scope] ?? 4);
@@ -264,11 +189,33 @@ export class PermissionManager {
                         continue;
                     }
                 }
-                return rule.action === "ask"; // 只有 ask 需要用户交互
+                if (rule.action === "allow") return { action: "allow", fromCache: false };
+                if (rule.action === "deny") return { action: "deny", fromCache: false };
+                return { action: "prompt", fromCache: false };
             }
         }
 
-        return this.defaultMode === "ask"; // 无规则命中时，默认模式决定
+        // 3. 默认策略
+        const action = this.defaultMode === "ask" ? "prompt" : this.defaultMode;
+        return { action, fromCache: false };
+    }
+
+    /**
+     * 检查工具调用是否需要用户允许 — PermissionManager 的核心方法
+     */
+    async check(toolUse: ToolUse, forceRecheck = false): Promise<boolean> {
+        const decision = this.decide(toolUse, forceRecheck);
+        if (decision.action === "allow") return true;
+        if (decision.action === "deny") return false;
+        return this.promptUser(toolUse);
+    }
+
+    /**
+     * 预检：判断工具调用是否会触发用户确认弹窗（同步、非阻塞）
+     */
+    willPromptUser(toolUse: ToolUse): boolean {
+        const decision = this.decide(toolUse, false);
+        return decision.action === "prompt";
     }
 
     /**
@@ -391,14 +338,69 @@ export class PermissionManager {
      */
     private buildCacheKey(toolUse: ToolUse): string {
         if (toolUse.name === "Bash" && typeof toolUse.input.command === "string") {
-            const cmdBase = toolUse.input.command.split(" ")[0];
+            const cmdBase = this.extractBashBaseCommand(toolUse.input.command);
             return `Bash:${cmdBase}`;
         }
         // Write/Edit 按文件路径细化：确认写入 fileA 不会连带放行 fileB
         if ((toolUse.name === "Write" || toolUse.name === "Edit") && toolUse.input.file_path) {
-            return `${toolUse.name}:${String(toolUse.input.file_path)}`;
+            const normalizedPath = this.normalizeFilePath(String(toolUse.input.file_path));
+            return `${toolUse.name}:${normalizedPath}`;
         }
         return toolUse.name;
+    }
+
+    /**
+     * 从 Bash 命令字符串中提取基准命令
+     *
+     * 处理以下场景：
+     *   - 简单命令: "npm test" → "npm"
+     *   - sudo 提权: "sudo npm install" → "npm" (跳过 sudo)
+     *   - 管道: "cat file | grep x" → "cat" (取管道第一个命令)
+     *   - 命令链: "npm ci && npm test" → "npm" (取第一个命令)
+     *   - 重定向: "echo hi > file" → "echo" (取重定向前的命令)
+     */
+    private extractBashBaseCommand(command: string): string {
+        // 去除首尾空白，按 ; 或 && 或 || 拆分，取第一段
+        const firstSegment = command.trim().split(/[;&|]{1,2}/)[0].trim();
+        // 按管道拆分，取第一段
+        const firstPipe = firstSegment.split("|")[0].trim();
+        // 按重定向拆分，取第一段
+        const firstRedirect = firstPipe.split(/[<>]/)[0].trim();
+        // 按空白拆分取第一个词
+        const words = firstRedirect.split(/\s+/);
+        // 跳过 sudo / pkexec 等提权前缀
+        const privEscSet = new Set(["sudo", "pkexec", "doas", "run0"]);
+        let idx = 0;
+        while (idx < words.length && privEscSet.has(words[idx])) {
+            idx++;
+        }
+        // 跳过 env 前缀 (env VAR=val cmd)
+        if (idx < words.length && words[idx] === "env") {
+            idx++;
+            // 跳过环境变量赋值 (KEY=value)
+            while (idx < words.length && words[idx].includes("=")) {
+                idx++;
+            }
+        }
+        if (idx < words.length && words[idx].length > 0) {
+            return words[idx];
+        }
+        // 回退：取第一个非空词
+        return words.find((w) => w.length > 0) ?? "unknown";
+    }
+
+    /**
+     * 规范化文件路径用于缓存 key
+     */
+    private normalizeFilePath(filePath: string): string {
+        // 动态导入 path 模块，浏览器环境回退到简单规范化
+        try {
+            const path = require("node:path") as typeof import("node:path");
+            return path.resolve(filePath);
+        } catch {
+            // 非 Node 环境：去除前导 ./ 和多余斜杠
+            return filePath.replace(/^\.\//, "").replace(/\/+/g, "/");
+        }
     }
 
     /**
