@@ -189,7 +189,7 @@ Agent 执行 Bash/Write/Edit 等操作前需要终端确认：
 packages/
 ├── core/src/
 │   ├── types/        # 消息、工具、Agent、配置、会话
-│   ├── agent/        # ReAct 主循环 + PlanMode/中间件/压缩 + error-recovery/(重试/熔断/回退)
+│   ├── agent/        # ReAct 主循环 + PlanMode/LLMCall/ToolExec/中间件/压缩 + error-recovery
 │   ├── router/       # 意图识别 + 分发
 │   ├── llm/          # Anthropic / OpenAI Provider + Token 计数
 │   ├── tools/        # 23 个内置工具 + 注册中心
@@ -232,8 +232,9 @@ packages/
 | [05-开发手册](docs/05-开发手册.md) | 环境搭建、项目结构、添加工具/Provider、调试、发布 |
 | [06-测试手册](docs/06-测试手册.md) | 测试策略、覆盖率目标、CI 流水线、检查清单 |
 | [07-功能差距](docs/07-功能差距与待办事项.md) | 与 Claude Code 差距对比、已/待实现事项 |
-| [08-01-代码质量修复](docs/08-01-代码质量修复记录.md) | 8 个代码质量问题的分析与修复（规划闸门、Token 估算、Bash 权限、配置合并等） |
-| [08-02-架构重构](docs/08-02-架构重构记录.md) | 7 个架构问题的分析与修复（AgentLoop 拆分、中间件、状态机、PlanMode 等） |
+| [08-01-代码质量修复](docs/08-01-代码质量修复记录.md) | 8 个代码质量问题的分析与修复 |
+| [08-02-架构重构](docs/08-02-架构重构记录.md) | 7 个架构问题的分析与修复 |
+| [08-03-架构优化补充](docs/08-03-架构优化补充记录.md) | services 迁移、LLMCallManager、ToolExecutor |
 
 ## 与 Claude Code 对比
 

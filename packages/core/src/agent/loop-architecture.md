@@ -10,7 +10,7 @@
 - 管理 Agent 生命周期状态机（8 种状态）
 - 调度 LLM 推理→工具调用→观察→再推理的循环
 - 将工具执行结果反馈给 LLM，形成闭环
-- 集成错误恢复、权限检查、可观测性等横切关注点
+- 编排子模块协作（PlanModeManager、LLMCallManager、ToolExecutor、ErrorRecoveryManager 等）
 
 ## 2. 在系统中的位置
 
@@ -19,24 +19,32 @@
 │  IntentRouter                                   │
 │    └── 自然语言输入 → AgentLoop.run()             │
 ├─────────────────────────────────────────────────┤
-│  AgentLoop (本文档)                              │
+│  AgentLoop (编排层, 775 行)                       │
 │    ├── buildInitialMessages()  // 构建上下文      │
 │    ├── while (toolRounds < max)                 │
-│    │    ├── provider.chat()     // LLM 推理      │
-│    │    ├── permissionMgr.check() // 权限检查     │
-│    │    └── tool.execute()      // 工具执行 ⚡     │
+│    │    ├── llmCallManager.streamCall() // LLM  │
+│    │    ├── toolExecutor.executeAll() // 工具    │
+│    │    └── planModeManager.*()  // Plan Mode   │
 │    ├── ErrorRecoveryManager      // 错误恢复      │
-│    ├── Summarizer                // 上下文压缩    │
-│    ├── CacheManager              // Prompt Cache │
-│    ├── ContextMonitor            // Token 监控   │
+│    ├── ContextCompactor          // 上下文压缩    │
+│    ├── MiddlewarePipeline        // 中间件管道    │
 │    └── ObservabilityManager      // 可观测性      │
 ├──────────────────────────────────────────────────┤
+│  提取的子模块 (agent/ 目录)                        │
+│    ├── PlanModeManager     // Plan Mode 管理     │
+│    ├── LLMCallManager      // LLM 流式调用       │
+│    ├── ToolExecutor        // 工具执行管道        │
+│    ├── ContextCompactor    // 上下文压缩          │
+│    ├── MiddlewarePipeline  // 中间件管道          │
+│    ├── PlanState           // 规划状态持有者       │
+│    └── error-recovery/     // 错误恢复子系统       │
+├──────────────────────────────────────────────────┤
 │  LLMProvider (Anthropic / OpenAI)                │
-│  ToolRegistry (20+ 内置工具)                       │
+│  ToolRegistry (23 个内置工具)                      │
 └──────────────────────────────────────────────────┘
 ```
 
-AgentLoop 是"调度者"而非"执行者"：它不直接调用 LLM API，不直接执行工具逻辑，而是通过接口编排下层模块协作。
+AgentLoop 是"编排者"而非"执行者"：具体的 LLM 调用、工具执行、Plan Mode 管理、上下文压缩均已委托给独立子模块。
 
 ## 3. 状态机设计
 
@@ -134,11 +142,13 @@ AgentLoop 内部维护一个 8 状态机。状态围绕 `while (toolRounds < max
 
 **三个退出点，都在 while 循环内部通过 `return` 触发**：
 
-| 退出点 | 代码位置 | 去向 |
-| ------ | -------- | ---- |
-| 无工具调用 | `toolUses.length === 0` (L379) | DONE |
-| 连续 3 次错误 | `consecutiveErrors >= 3` (L564) | ERROR |
-| 用户中断 | `signal.aborted` (L218) | DONE |
+| 退出点 | 代码位置 | 状态 | 去向 |
+| ------ | -------- | ---- | ---- |
+| 无工具调用 | `toolUses.length === 0` | setState(DONE) | yield done, return |
+| 连续 3 次错误 | `consecutiveErrors >= 3` | setState(ERROR) | yield error, return false |
+| 用户中断 | `signal.aborted` | setState(DONE) | yield done, return |
+| LLM 恢复失败 | `llmRecoveryCount > 3` / 不可恢复 | setState(ERROR) | yield error, return "abort" |
+| 熔断触发 | `ToolExecutor 返回 abort=true` | setState(ERROR) | return |
 
 第 4 个退出口在 while 之外：`toolRounds >= maxToolRounds` 导致 while 条件为 false，自然落出循环 (L591-601)，yield error + done。
 
@@ -152,98 +162,140 @@ AgentLoop 内部维护一个 8 状态机。状态围绕 `while (toolRounds < max
 |---------|---------|---------|
 | IDLE | `run()` 被调用 | THINKING |
 | THINKING | LLM 流式响应中 | THINKING |
-| THINKING | LLM 返回 tool_use | WAITING_APPROVAL / EXECUTING |
+| THINKING | LLM 返回 tool_use, 需审批 | WAITING_APPROVAL |
+| THINKING | LLM 返回 tool_use, 无需审批 | EXECUTING |
 | THINKING | LLM 返回文本，无工具调用 | DONE |
-| THINKING | LLM 调用抛异常，可恢复 | RECOVERING → THINKING |
-| THINKING | LLM 调用抛异常，不可恢复 | ERROR |
+| THINKING | LLM 异常，可恢复 | RECOVERING → THINKING |
+| THINKING | LLM 异常，不可恢复 | ERROR |
+| THINKING | LLM error chunk, 可恢复 | RECOVERING → THINKING |
 | WAITING_APPROVAL | 用户审批通过 | EXECUTING |
 | WAITING_APPROVAL | 用户拒绝 | THINKING (反馈 LLM) |
-| EXECUTING | 工具执行完成 (toolRounds < max) | THINKING (while 循环继续) |
-| EXECUTING | 工具执行完成 (toolRounds >= max) | DONE (退出 while) |
+| EXECUTING | 工具执行完成 | THINKING (while 循环继续) |
 | EXECUTING | 连续 3 次错误 | ERROR |
 | EXECUTING | EnterPlanMode 工具调用 | PLANNING |
 | PLANNING | ExitPlanMode 工具调用 | THINKING |
+| RECOVERING | 恢复完成 | THINKING (continue 回到循环顶部) |
 | (任意) | signal.aborted | DONE |
+
+所有状态转换均通过 `setState(newState, reason)` 统一入口，14 个调用点均带原因描述。
 
 ## 4. 核心数据结构
 
 ### 4.1 内部字段
 
 ```
-AgentLoop
-├── state: AgentState           // 当前状态机状态
+AgentLoop (775 行)
+├── state: AgentState           // 当前状态机状态 (通过 setState() 统一设置)
 ├── messages: Message[]         // 累积的完整对话上下文
 ├── toolRounds: number          // 当前会话工具调用轮次计数
 ├── tokenUsage: TokenUsage      // Token 消耗统计 (input/output/cache)
 ├── consecutiveErrors: number   // 连续工具错误计数 (>=3 触发保护)
-├── llmRecoveryCount: number    // LLM 恢复连续计数 (>=3 触发保护，防止恢复死循环)
-├── planMode: boolean           // 是否处于计划模式
-└── originalTools: Tool[]       // 进入计划模式前的完整工具列表
+├── llmRecoveryCount: number    // LLM 恢复连续计数 (>=3 触发保护)
+├── planState: PlanState        // 规划闸门状态 (todos/修改计数/漂移计数)
+│
+├── [子模块 — 每个 run() 复用同一实例]
+├── planModeManager: PlanModeManager   // Plan Mode 工具过滤+闸门+切换
+├── llmCallManager: LLMCallManager     // LLM 流式调用+chunk 分发
+├── toolExecutor: ToolExecutor         // 工具执行管道
+├── compactor: ContextCompactor        // 上下文压缩
+└── middleware: MiddlewarePipeline      // 中间件管道 (公开可读写)
 ```
+
+已移除的字段: `planMode`, `originalTools` (→ PlanModeManager 内部管理)
 
 ### 4.2 运行时依赖 (AgentLoopContext)
 
-AgentLoop 通过 `AgentLoopContext` 接口接收所有外部依赖，遵循依赖倒置原则：
+AgentLoop 通过 `AgentLoopContext` 接口接收所有外部依赖。2026-06-16 重构引入 `services` 子对象收敛可选服务：
 
-| 依赖 | 类型 | 作用 |
-|------|------|------|
-| `permissionManager` | PermissionManager | 工具调用前的权限校验 |
-| `sandbox` | ISandbox (可选) | 容器化隔离执行 |
-| `logger` | Logger (可选) | 结构化日志记录 |
-| `sessionId` | string | 会话标识，工具上下文透传 |
-| `workingDirectory` | string | 工作目录，工具相对路径解析 |
-| `appendMessage` | callback | 推送中间状态消息到 UI |
-| `signal` | AbortSignal (可选) | 用户取消信号 |
-| `errorRecoveryManager` | ErrorRecoveryManager (可选) | 错误分类、重试、回退、熔断 |
-| `summarizer` | Summarizer (可选) | LLM 驱动的对话摘要压缩 |
-| `observability` | ObservabilityManager (可选) | Transcript、Metrics、Span Tracing |
-| `cacheManager` | CacheManager (可选) | Prompt Cache 状态追踪 |
-| `contextMonitor` | ContextMonitor (可选) | Token 使用率实时监控 |
+```
+AgentLoopContext
+├── [核心必需 — 4 个]
+├── permissionManager: PermissionManager
+├── sessionId: string
+├── workingDirectory: string
+├── appendMessage: (content: string) => Promise<void>
+│
+├── [顶层可选 — 向后兼容]
+├── signal?: AbortSignal
+├── logger?: Logger
+├── sandbox?: ISandbox
+├── errorRecoveryManager?: ErrorRecoveryManager
+├── summarizer?: Summarizer
+├── observability?: ObservabilityManager
+├── cacheManager?: CacheManager
+├── contextMonitor?: ContextMonitor
+│
+└── [服务聚合 — 推荐新代码使用]
+    services?: AgentServices {
+        errorRecovery, observability, summarizer,
+        cacheManager, contextMonitor, sandbox
+    }
+```
+
+实际代码中所有访问均使用 `services` 优先 + 顶层兜底:
+`(loopCtx.services?.xxx ?? loopCtx.xxx)?.method()`
 
 ## 5. 主流程 (run 方法)
 
-`run()` 拆分为三个阶段的子生成器，通过 `yield*` 委托调用，主循环只做编排：
+`run()` 拆分为三个阶段的子生成器，通过 `yield*` 委托调用。具体逻辑委托给子模块：
 
 ```
 run(userInput, config, loopCtx)
  │
- ├─ 1. 重置内部状态 (state/toolRounds/consecutiveErrors/llmRecoveryCount/planMode)
- ├─ 2. buildInitialMessages(userInput, config) 构建消息上下文
- ├─ 3. observability.startTurn() 开启 Trace
+ ├─ 1. 重置内部状态 + setState(IDLE)
+ ├─ 2. planState.reset() → TodoWriteTool.setPlanState(planState)
+ ├─ 3. planModeManager.reset(enforcementMode)
+ ├─ 4. buildInitialMessages(userInput, config)
  │
- └─ 4. while (toolRounds < maxToolRounds):
+ └─ 5. while (toolRounds < maxToolRounds):
        │
-       ├─ 4.1 signal.aborted? → yield done, return
+       ├─ 5.1 signal.aborted? → setState(DONE), return
        │
-       ├─ 4.2 Phase 1: yield* executeThinkingPhase(config, loopCtx, signal)
-       │     ├─ proactiveContextCheck() — 主动检查上下文使用率 (>=85% 预压缩)
-       │     ├─ provider.chat() → 流式 chunk 处理
-       │     │   ├─ "text" / "thinking" → yield
+       ├─ 5.2 Phase 1: yield* executeThinkingPhase(config, loopCtx, signal)
+       │     ├─ proactiveContextCheck() — 主动上下文检查 (阈值从 config 读取)
+       │     ├─ setState(THINKING)
+       │     ├─ planModeManager.filterTools() — Plan Mode 工具过滤
+       │     ├─ llmCallManager.streamCall() — 流式 LLM 调用 (chunk 分发+token 追踪)
+       │     │   ├─ "text" / "thinking" → yield 透传
        │     │   ├─ "tool_use" → 收集
-       │     │   ├─ "stop" → 更新 token 统计, llmRecoveryCount=0
-       │     │   └─ "error" → classifyChunkError → handleLLMRecovery()
+       │     │   ├─ "stop" → tokenUsage 更新 + cacheManager/contextMonitor 同步
+       │     │   └─ "error" → errorRecoveryManager.classifyErrorCode() 分类
+       │     ├─ result.hasError? → handleLLMRecovery() 处理 error chunk
        │     ├─ catch 异常 → handleLLMRecovery()
-       │     │   ├─ 可恢复 + llmRecoveryCount <= 3 → yield recovering, continue
-       │     │   └─ 不可恢复 或 llmRecoveryCount > 3 → yield error, return
-       │     └─ toolUses.length === 0? → yield done, return
+       │     └─ toolUses.length === 0? → setState(DONE), return
        │
-       ├─ 4.3 追加 assistant 消息
+       ├─ 5.3 追加 assistant 消息到 messages[]
        │
-       ├─ 4.4 Phase 2: yield* executeToolPhase(toolUses, config, loopCtx, signal)
-       │     └─ for each toolUse (顺序):
-       │          ├─ findTool() / 熔断检查 / requiresApproval → permissionManager.check()
-       │          ├─ tool.execute() → 成功: consecutiveErrors=0, 失败: 错误恢复
-       │          └─ 熔断触发 → return abort=true
+       ├─ 5.4 Phase 2: yield* executeToolPhase(toolUses, config, loopCtx, signal)
+       │     └─ toolExecutor.executeAll() — 六步管道:
+       │          1. 查找工具 (config.tools.find)
+       │          2. 熔断器检查 (errorRecoveryManager.checkCircuitBreaker)
+       │          3. 权限检查 (permissionManager.willPromptUser + check)
+       │          4. 规划闸门 (planModeManager.enforceGate)
+       │          5. 工具执行 (tool.execute)
+       │          6. 错误处理 (errorRecoveryManager.handleToolError + 熔断)
+       │        回调: onStateChange → setState, onConsecutiveError → consecutiveErrors
        │
-       ├─ 4.5 Phase 3: yield* finalizeRound(toolResults, toolUses, config, loopCtx)
-       │     ├─ handlePlanModeTransitions() — Plan Mode 检测
-       │     ├─ consecutiveErrors >= 3? 或 llmRecoveryCount > 3? → yield error, return
-       │     ├─ truncateToolResults() — 截断过大结果 (>8000 token 估)
+       ├─ 5.5 Phase 3: yield* finalizeRound(toolResults, toolUses, config, loopCtx)
+       │     ├─ planModeManager.handleTransitions() — Plan Mode 检测
+       │     ├─ consecutiveErrors >= 3? → setState(ERROR), return
+       │     ├─ truncateToolResults() — 截断过大结果 (ASCII/CJK 区分估)
        │     ├─ 追加 tool_result 到 messages[]
        │     └─ toolRounds++
        │
-       └─ (回到 4.1)
+       └─ (回到 5.1)
 ```
+
+### 5.1 提取的子模块职责
+
+| 子模块 | 原位置 | 提取后行数 | 调用方式 |
+|--------|--------|-----------|---------|
+| `PlanModeManager` | AgentLoop.enforcePlanningGate + handlePlanModeTransitions + 字段 | 130 行 | `filterTools()` / `enforceGate()` / `handleTransitions()` |
+| `LLMCallManager` | executeThinkingPhase 内 ~60 行 switch-case | 166 行 | `yield* streamCall(messages, ctx, tokenUsage)` |
+| `ToolExecutor` | executeToolPhase 内 ~140 行管道 | 223 行 | `yield* executeAll(toolUses, ctx, onStateChange, onError)` |
+| `ContextCompactor` | AgentLoop.compactMessages (32 行) | 82 行 | `compactor.compact(messages, summarizer)` |
+| `MiddlewarePipeline` | (新增) | 156 行 | `loop.middleware.use(mw)` |
+| `PlanState` | TodoWriteTool 静态字段 | 108 行 | `TodoWriteTool.setPlanState(planState)` |
 
 ### 5.1 新增保护机制
 
@@ -283,56 +335,52 @@ provider.chat() 抛异常
 
 ```
 chunk.type === "error"
-  → classifyChunkError(code) 映射错误码到 ErrorCategory
-  → errorRecoveryManager.handleLLMError(...)
-  → 同上恢复流程
+  → errorRecoveryManager.classifyErrorCode(code) — 统一入口，消除 AgentLoop 内重复分类
+  → handleLLMRecovery() — 同上恢复流程
 ```
+
+错误码分类已从 `AgentLoop.classifyChunkError()` 迁移到 `ErrorClassifier.classifyByCode()`，通过 `ErrorRecoveryManager.classifyErrorCode()` 公开调用。LLMCallManager 内部保留回退分类（errorRecoveryManager 不可用时）。
 
 ### 6.3 工具执行层
 
 ```
-tool.execute() 抛异常
-  → errorRecoveryManager.handleToolError(err, toolName)
-    ├─ CIRCUIT_BREAK: yield error, return (终止循环)
-    └─ FEEDBACK_TO_LLM: 结果标记 is_error, 继续循环
+toolExecutor.executeAll() 内部
+  → tool.execute() 抛异常
+    → errorRecoveryManager.handleToolError(err, toolName)
+      ├─ CIRCUIT_BREAK: 回调 abort，AgentLoop setState(ERROR) + return
+      └─ FEEDBACK_TO_LLM: 结果标记 is_error，继续循环
 ```
-
-错误码到 ErrorCategory 的映射逻辑在 `classifyChunkError()`:
-
-| LLM 错误码 | ErrorCategory |
-|-----------|---------------|
-| `rate_limit_error`, `rate_limit` | RATE_LIMIT |
-| `authentication_error`, `invalid_auth` | AUTH |
-| `invalid_request_error` | INVALID_REQUEST |
-| `context_length_exceeded`, `token_limit_exceeded` | CONTEXT_OVERFLOW |
-| `server_error`, `api_error`, `overloaded` | PROVIDER_ERROR |
-| `network_error`, `timeout`, `connection_error` | NETWORK |
 
 ## 7. 上下文压缩
 
-当 LLM 返回 CONTEXT_OVERFLOW 错误时，`compactMessages()` 被调用：
+当 LLM 返回 CONTEXT_OVERFLOW 或 ContextMonitor 超过阈值时，`ContextCompactor.compact()` 被调用（已从 AgentLoop.compactMessages 提取）：
 
 ```
-compactMessages(summarizer?)
+compactor.compact(messages, summarizer?)
   │
-  ├─ 保留 system 消息 (role: "system")
-  ├─ 保留最近 50% 的非 system 消息
+  ├─ 保留 system 消息 (role: "system") — AI 的行为宪章必须完整保留
+  ├─ 保留最近 50% 的非 system 消息 (最少 2 条)
   │
   └─ 生成摘要消息插入中间:
        ├─ summarizer.getAccumulatedSummary() (LLM 语义摘要)
-       └─ 或 "[上下文压缩]: 省略了 N 条历史消息" (简单截断)
+       └─ 或 "[上下文压缩]: 省略了 N 条历史消息" (简单截断降级)
 ```
 
-压缩策略优先使用 LLM 驱动的语义摘要，保留更多关键信息；未配置 Summarizer 时回退到简单截断。
+压缩阈值从 `config.contextCompressThreshold` 读取（默认 85），不再硬编码。
 
 ## 8. 计划模式
 
-计划模式是一个特殊的运行状态，通过两个内置工具触发：
+计划模式通过 `PlanModeManager` 管理（已从 AgentLoop 提取为独立模块），通过两个内置工具触发：
 
-- **EnterPlanMode**: 保存完整工具列表 (`originalTools`)，将可用工具过滤为只读子集 (`filterToolsForPlanMode`)，状态切换为 `PLANNING`
-- **ExitPlanMode**: 恢复完整工具列表，输出 plan 内容，状态返回 `THINKING`
+- **EnterPlanMode**: `PlanModeManager.handleTransitions()` 检测到后设置内部 `planMode = true`，下次 LLM 调用前 `filterTools()` 将工具过滤为只读子集
+- **ExitPlanMode**: `handleTransitions()` 检测到后设置 `planMode = false`，恢复完整工具列表
 
-计划模式下的工具过滤发生在每次 LLM 调用前（`loop.ts:243-245`），而非一次性切换，这确保了即使工具列表在运行时变动也能正确过滤。
+`enforceGate()` 提供三级闸门 (off/soft/hard)：
+- **off**: 完全跳过
+- **soft**: 首次修改提醒，二次拒绝
+- **hard**: 无计划拒绝修改，漂移 3 次强制重规划
+
+工具过滤发生在每次 LLM 调用前（`planModeManager.filterTools(config.tools)`），非一次性快照，确保运行时工具变动也能正确过滤。
 
 ## 9. 安全保护机制
 
@@ -344,8 +392,9 @@ compactMessages(summarizer?)
 | 用户中断检测 | `signal.aborted` | 每次循环入口检测，立即终止 |
 | 熔断器 | `errorRecoveryManager.checkCircuitBreaker()` | 工具执行前检查，熔断中直接拒绝 |
 | 权限检查 | `tool.requiresApproval()` | 弹窗→用户确认→放行/拒绝 |
-| 主动上下文压缩 | `contextMonitor.usagePercent >= 85%` | 每次 LLM 调用前检查，不等 API 报错 |
-| 工具结果截断 | 估算 token > 8000 | 追加到 messages 前截断，防止撑爆上下文 |
+| 主动上下文压缩 | `config.contextCompressThreshold` (默认 85%) | 每次 LLM 调用前检查，不等 API 报错 |
+| 工具结果截断 | 估算 token > 8000 (ASCII/CJK 区分估算) | 追加到 messages 前在安全边界（换行符）截断 |
+| 路径 / 命令安全 | Bash 命令解析 (extractBashBaseCommand) + 路径规范化 (normalizeFilePath) | 权限细粒度缓存 key，防绕过 |
 
 ## 10. 可观测性
 
@@ -366,39 +415,37 @@ AgentLoop 通过可选的 `ObservabilityManager` 记录：
 
 AgentLoop 的设计预留了以下扩展点：
 
-1. **动态工具注册**: `config.tools` 每次 LLM 调用前读取，支持运行时增删工具
+1. **动态工具注册**: `config.tools` 每次 LLM 调用前读取，`ToolRegistry.register(tool, { replace: true })` 支持热替换
 2. **Provider 运行时切换**: ErrorRecoveryManager 可以通过更新 `config.provider` 实现 Provider 热切换
-3. **自定义错误分类**: `classifyChunkError()` 可以扩展新的错误码映射
+3. **中间件管道**: `loop.middleware.use(mw)` 注册拦截器，6 个生命周期钩子 (beforeLLMCall / afterLLMCall / beforeToolExecution / afterToolExecution / afterRound)
 4. **消息拦截**: `buildInitialMessages()` 可扩展，在 system prompt 和历史消息之间插入自定义消息
-5. **新 TurnEvent 类型**: AsyncGenerator 的 yield 机制天然支持新增事件类型，UI 层按 type 分发
+5. **新 TurnEvent 类型**: AsyncGenerator 的 yield 机制天然支持新增事件类型
+6. **services 注入**: 通过 `AgentLoopContext.services` 统一注入可选服务，新服务加入 `AgentServices` 接口即可
 
 ## 12. 架构评估
 
 ### 优点
 
+**职责拆分清晰**
+`AgentLoop` 从 1035 行单一类演进为 775 行编排层 + 6 个子模块（PlanModeManager / LLMCallManager / ToolExecutor / ContextCompactor / MiddlewarePipeline / PlanState），每个模块职责单一、可独立测试。
+
 **依赖倒置彻底**
-`AgentLoopContext` 接口注入全部 12 项外部依赖（权限、沙箱、日志、错误恢复、可观测性等），`AgentLoop` 自身零外部 import（不依赖 fs、网络、具体 Provider SDK）。这使得 core 包可独立测试，上层接入可替换任意实现。
+`AgentLoopContext` 接口注入全部外部依赖，`services` 子对象收敛可选服务。`AgentLoop` 自身零外部副作用依赖（不依赖 fs、网络、具体 Provider SDK）。
 
 **事件流解耦 UI**
-`run()` 是 AsyncGenerator，以 `yield TurnEvent` 向外输出。CLI、VS Code、Web 三种 UI 形态共享同一事件流，只需按 `type` 分发渲染。新增事件类型不影响已有消费者。
+`run()` 是 AsyncGenerator，以 `yield TurnEvent` 向外输出。CLI、VS Code、Web 三种 UI 形态共享同一事件流。
 
 **错误恢复分层合理**
-LLM 层错误（重试/切换 Provider/压缩上下文）和工具层错误（反馈 LLM/熔断）分开处理，各自有独立的决策链路。Provider 回退链支持运行时热切换，用户无感知。
+LLM 层错误（重试/切换 Provider/压缩上下文）和工具层错误（反馈 LLM/熔断）分开处理。错误码分类统一在 `ErrorRecoveryManager` 中。
 
 **安全保护多层兜底**
-连续错误（≥3）、最大轮次、信号中断、熔断器、权限审批五层保护互相独立。任意一层触发都能终止循环，不存在单点失效。熔断器提供工具级保护，连续错误保护是兜底。
+连续错误（≥3）、最大轮次、信号中断、熔断器、权限审批、规划闸门六层保护互相独立。
 
-**Plan Mode 无侵入**
-通过 `EnterPlanMode` / `ExitPlanMode` 两个工具在循环内切换，不破坏主流程结构。工具过滤发生在每次 LLM 调用前而非一次性快照，运行时工具变动也能正确响应。
+**中间件可扩展**
+`MiddlewarePipeline` 提供 6 个生命周期钩子，支持审计、限流、脱敏等横切关注点，无需修改 AgentLoop 源码。
 
 ### 缺点与改进方向
 
-**待优化**：目前看收益有限，后续根据反馈持续优化
+**工具调用无并发**: 多个 tool_use 之间不一定有依赖但不支持并发执行。LLM 返回的 tool_use 顺序只是"建议顺序"。
 
-**工具调用无并发**
-多个 tool_use 之间不一定有依赖（如同时读两个文件、并行搜索），但当前一律顺序执行。LLM 返回的 tool_use 顺序只是"建议顺序"，不是强制依赖。
-→ 可引入工具依赖声明（`dependsOn: ["tool_id"]`），无依赖的工具并发执行。
-
-**缺少中间件机制**
-如果在 LLM 调用前后或工具执行前后需要插入自定义逻辑（审计、额外脱敏、自定义限流），当前只能修改 AgentLoop 源码。Hook 系统在 AgentLoop 外部，不能介入循环内部环节。
-→ 可引入 `AgentMiddleware` 链：`(ctx, next) => yield* next(ctx)`。
+**services 向后兼容层**: 顶层可选字段和 `services` 子对象双通道并存，新增代码需统一走 `services`。

@@ -25,7 +25,7 @@
 import type { Message, ToolUse, ToolResult, TokenUsage } from "../types/messages";
 import { AgentState } from "../types/agent";
 import type { AgentConfig, TurnEvent } from "../types/agent";
-import type { Tool, ToolContext, ISandbox, Logger } from "../types/tools";
+import type { ISandbox, Logger } from "../types/tools";
 import type { PermissionManager } from "../permission/manager";
 import { ErrorRecoveryManager } from "./error-recovery/manager";
 import { RecoveryStrategy, ErrorCategory } from "./error-recovery/types";
@@ -38,6 +38,8 @@ import { ContextMonitor } from "../context/monitor";
 import { PlanModeManager } from "./plan-mode-manager";
 import { MiddlewarePipeline } from "./middleware";
 import { ContextCompactor } from "./context-compactor";
+import { LLMCallManager } from "./llm-call-manager";
+import { ToolExecutor } from "./tool-executor";
 
 // ─── 默认常量 ───
 
@@ -269,6 +271,18 @@ export class AgentLoop {
     private compactor: ContextCompactor = new ContextCompactor();
 
     /**
+     * 标记: llmCallManager — LLM 调用管理器
+     * 解决问题: 将流式调用、chunk 分发、token 追踪从 executeThinkingPhase 中抽离。
+     */
+    private llmCallManager: LLMCallManager = new LLMCallManager();
+
+    /**
+     * 标记: toolExecutor — 工具执行器
+     * 解决问题: 将工具查找、熔断、权限、闸门、执行、错误处理管道从 executeToolPhase 中抽离。
+     */
+    private toolExecutor: ToolExecutor = new ToolExecutor();
+
+    /**
      * 标记: run — Agent 主循环入口，返回异步事件流
      * 解决问题: 接收用户输入，通过 ReAct 循环完成推理和工具调用，
      *          以 TurnEvent 异步生成器的形式逐步输出事件，
@@ -298,7 +312,7 @@ export class AgentLoop {
 
         this.messages = this.buildInitialMessages(userInput, config);
 
-        const traceId = loopCtx.observability?.startTurn(userInput) ?? "";
+        const traceId = (loopCtx.services?.observability ?? loopCtx.observability)?.startTurn(userInput) ?? "";
         const signal = loopCtx.signal ?? new AbortController().signal;
 
         // ─── ReAct 主循环 ───
@@ -306,7 +320,7 @@ export class AgentLoop {
             // 用户中断检测
             if (signal.aborted) {
                 this.setState(AgentState.DONE, "用户中断 (signal.aborted)");
-                loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+                (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
             }
@@ -317,13 +331,13 @@ export class AgentLoop {
 
             // 无工具调用 → 自然结束
             if (thinkResult.toolUses.length === 0) {
-                const alert = loopCtx.contextMonitor?.getAlert();
+                const alert = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor)?.getAlert();
                 if (alert) {
-                    const status = loopCtx.contextMonitor!.getStatus();
+                    const status = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor)!.getStatus();
                     yield { type: "context_alert", health: status.health, message: alert, usagePercent: status.usagePercent };
                 }
                 this.setState(AgentState.DONE, "无工具调用，自然结束");
-                loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+                (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
                 yield { type: "done", usage: this.tokenUsage };
                 return;
             }
@@ -360,7 +374,7 @@ export class AgentLoop {
             error: new Error(`达到最大工具调用轮次 (${config.maxToolRounds})，对话已终止`),
         };
         this.setState(AgentState.DONE, "达到最大工具调用轮次");
-        loopCtx.observability?.endTurn(traceId, this.tokenUsage, this.toolRounds);
+        (loopCtx.services?.observability ?? loopCtx.observability)?.endTurn(traceId, this.tokenUsage, this.toolRounds);
         yield { type: "done", usage: this.tokenUsage };
     }
 
@@ -384,99 +398,58 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
         signal: AbortSignal,
     ): AsyncGenerator<TurnEvent, ThinkingResult> {
-        // ─── 主动上下文检查: 超过告警阈值时预压缩，不等 API 报错 ───
         this.proactiveContextCheck(config, loopCtx);
-
         this.setState(AgentState.THINKING, "LLM 推理开始");
 
-        let toolUses: ToolUse[] = [];
-        let hasError = false;
-        let errorCategory: ErrorCategory | undefined;
-        let llmSpanId = "";
+        const llmSpanId = (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMCall(
+            config.model, this.messages.length, this.tokenUsage.inputTokens,
+        ) ?? "";
 
         try {
-            llmSpanId = loopCtx.observability?.recordLLMCall(
-                config.model,
-                this.messages.length,
-                this.tokenUsage.inputTokens,
-            ) ?? "";
-
             const activeTools = this.planModeManager.filterTools(config.tools);
 
-            const chunks = config.provider.chat(this.messages, {
+            const result = yield* this.llmCallManager.streamCall(this.messages, {
+                provider: config.provider,
                 model: config.model,
-                maxTokens: config.maxTokensPerTurn,
-                tools: activeTools.map((t) => this.toolToLLMFormat(t)),
-                thinking: config.thinkingEnabled,
+                maxTokensPerTurn: config.maxTokensPerTurn,
+                thinkingEnabled: config.thinkingEnabled,
                 thinkingTokens: config.thinkingTokens,
                 signal,
-            });
+                activeTools,
+                errorRecoveryManager: (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager),
+                cacheManager: (loopCtx.services?.cacheManager ?? loopCtx.cacheManager),
+                contextMonitor: (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor),
+            }, this.tokenUsage);
 
-            for await (const chunk of chunks) {
-                switch (chunk.type) {
-                    case "text":
-                        yield { type: "text", content: chunk.content };
-                        break;
-                    case "thinking":
-                        yield { type: "thinking", content: chunk.content };
-                        break;
-                    case "tool_use":
-                        toolUses.push({
-                            id: chunk.id,
-                            name: chunk.name,
-                            input: chunk.input as Record<string, unknown>,
-                        });
-                        break;
-                    case "stop":
-                        if (chunk.usage) {
-                            this.tokenUsage.inputTokens = chunk.usage.inputTokens;
-                            this.tokenUsage.outputTokens = chunk.usage.outputTokens;
-                            this.tokenUsage.cacheCreationInputTokens = chunk.usage.cacheCreationInputTokens;
-                            this.tokenUsage.cacheReadInputTokens = chunk.usage.cacheReadInputTokens;
-                            loopCtx.cacheManager?.updateFromUsage(this.tokenUsage);
-                        }
-                        loopCtx.contextMonitor?.update(this.tokenUsage);
-                        // LLM 调用成功，重置 LLM 恢复计数
-                        this.llmRecoveryCount = 0;
-                        break;
-                    case "error":
-                        errorCategory = loopCtx.errorRecoveryManager?.classifyErrorCode(chunk.code) ?? ErrorCategory.PROVIDER_ERROR;
-                        yield {
-                            type: "error",
-                            error: new Error(`LLM 调用错误 [${chunk.code}]: ${chunk.message}`),
-                            category: errorCategory,
-                        };
-                        hasError = true;
-                        break;
+            // 流式 error chunk 恢复
+            if (result.hasError) {
+                const recoveryResult = yield* this.handleLLMRecovery(
+                    new Error(`LLM 调用错误: ${result.errorCategory}`),
+                    config, loopCtx, "LLM error chunk",
+                );
+                if (recoveryResult === "abort") {
+                    (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, result.toolUses.length, true, result.errorCategory);
+                    return { exit: true, toolUses: [] };
                 }
+                return { exit: false, toolUses: [] };
             }
+
+            this.llmRecoveryCount = 0;
+            (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, result.toolUses.length, false);
+            return { exit: false, toolUses: result.toolUses };
         } catch (error) {
             const err = error instanceof Error ? error : new Error(String(error));
-            loopCtx.observability?.recordError(err, ErrorCategory.NETWORK);
+            (loopCtx.services?.observability ?? loopCtx.observability)?.recordError(err, ErrorCategory.NETWORK);
 
             const recoveryResult = yield* this.handleLLMRecovery(
                 err, config, loopCtx, "LLM 调用异常",
             );
-            if (recoveryResult === "abort") return { exit: true, toolUses: [] };
-            // 恢复成功：config 可能已被更新（Provider 切换），回到 ThinkingResult 让主循环重试
-            return { exit: false, toolUses: [] };
-        }
-
-        // ─── 流式 error chunk 恢复 ───
-        if (hasError) {
-            const recoveryResult = yield* this.handleLLMRecovery(
-                new Error(`LLM 调用错误: ${errorCategory}`),
-                config, loopCtx, "LLM error chunk",
-            );
             if (recoveryResult === "abort") {
-                loopCtx.observability?.recordLLMResult(llmSpanId, this.tokenUsage, toolUses.length, true, errorCategory);
+                (loopCtx.services?.observability ?? loopCtx.observability)?.recordLLMResult(llmSpanId, this.tokenUsage, 0, true, ErrorCategory.NETWORK);
                 return { exit: true, toolUses: [] };
             }
             return { exit: false, toolUses: [] };
         }
-
-        loopCtx.observability?.recordLLMResult(llmSpanId, this.tokenUsage, toolUses.length, false);
-        return { exit: false, toolUses };
     }
 
     // ─── Phase 2: Execute ───
@@ -493,140 +466,33 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
         signal: AbortSignal,
     ): AsyncGenerator<TurnEvent, ExecuteResult> {
-        const toolResults: ToolResult[] = [];
+        const result = yield* this.toolExecutor.executeAll(toolUses, {
+            tools: config.tools,
+            permissionManager: loopCtx.permissionManager,
+            errorRecoveryManager: (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager),
+            observability: (loopCtx.services?.observability ?? loopCtx.observability),
+            planModeManager: this.planModeManager,
+            workingDirectory: loopCtx.workingDirectory,
+            sessionId: loopCtx.sessionId,
+            appendMessage: loopCtx.appendMessage,
+            sandbox: (loopCtx.services?.sandbox ?? loopCtx.sandbox),
+            logger: loopCtx.logger,
+            signal,
+        },
+            (s) => {
+                if (s === "WAITING_APPROVAL") this.setState(AgentState.WAITING_APPROVAL, "等待用户审批");
+                else if (s === "EXECUTING") this.setState(AgentState.EXECUTING, "开始执行工具");
+            },
+            (isError) => {
+                if (isError) this.consecutiveErrors++;
+                else this.consecutiveErrors = 0;
+            },
+        );
 
-        for (const toolUse of toolUses) {
-            yield { type: "tool_call", tool: toolUse };
-
-            const toolSpanId = loopCtx.observability?.recordToolCall(
-                toolUse.name,
-                Object.keys(toolUse.input),
-            ) ?? "";
-
-            // ─── 查找工具 ───
-            const tool = this.findTool(toolUse.name, config.tools);
-            if (!tool) {
-                const recovery = loopCtx.errorRecoveryManager
-                    ? loopCtx.errorRecoveryManager.handleToolNotFound(toolUse.name)
-                    : null;
-
-                toolResults.push({
-                    tool_use_id: toolUse.id,
-                    content: recovery?.error ?? `未知工具: ${toolUse.name}`,
-                    is_error: true,
-                });
-                this.consecutiveErrors++;
-                continue;
-            }
-
-            // ─── 熔断器检查 ───
-            if (loopCtx.errorRecoveryManager && !loopCtx.errorRecoveryManager.checkCircuitBreaker(toolUse.name)) {
-                const remainingMs = loopCtx.errorRecoveryManager.circuitBreaker.getRemainingOpenMs(toolUse.name);
-                toolResults.push({
-                    tool_use_id: toolUse.id,
-                    content: `工具 "${toolUse.name}" 已触发熔断保护，${Math.ceil(remainingMs / 1000)}s 后可重试`,
-                    is_error: true,
-                });
-                this.consecutiveErrors++;
-                continue;
-            }
-
-            // ─── 权限检查 ───
-            if (tool.requiresApproval(toolUse.input)) {
-                if (loopCtx.permissionManager.willPromptUser(toolUse)) {
-                    this.setState(AgentState.WAITING_APPROVAL, "等待用户审批");
-                    yield { type: "approval_request", tool: toolUse };
-                }
-
-                const approved = await loopCtx.permissionManager.check(toolUse);
-                if (!approved) {
-                    const recovery = loopCtx.errorRecoveryManager
-                        ? loopCtx.errorRecoveryManager.handlePermDenied(toolUse.name)
-                        : null;
-
-                    toolResults.push({
-                        tool_use_id: toolUse.id,
-                        content: recovery?.error ?? "用户拒绝了此操作",
-                        is_error: true,
-                    });
-                    this.consecutiveErrors++;
-                    continue;
-                }
-            }
-
-            // ─── 规划闸门检查 ───
-            const gateResult = this.planModeManager.enforceGate(toolUse.name);
-            if (gateResult.blocked) {
-                toolResults.push({
-                    tool_use_id: toolUse.id,
-                    content: gateResult.message!,
-                    is_error: true,
-                });
-                this.consecutiveErrors++;
-                continue;
-            }
-
-            // ─── 执行工具 ───
-            const toolCtx: ToolContext = {
-                workingDirectory: loopCtx.workingDirectory,
-                sessionId: loopCtx.sessionId,
-                appendMessage: loopCtx.appendMessage,
-                sandbox: loopCtx.sandbox,
-                logger: loopCtx.logger,
-                signal,
-            };
-
-            this.setState(AgentState.EXECUTING, "开始执行工具");
-            try {
-                const result = await tool.execute(toolUse.input, toolCtx);
-                // 软提醒：注入提示到结果
-                const finalResult = gateResult.message
-                    ? { ...result, content: `[规划提醒] ${gateResult.message}\n${result.content}` }
-                    : result;
-                toolResults.push({ ...finalResult, tool_use_id: toolUse.id });
-                this.consecutiveErrors = 0;
-                if (loopCtx.errorRecoveryManager) {
-                    loopCtx.errorRecoveryManager.recordToolSuccess(toolUse.name);
-                }
-                yield { type: "tool_result", result };
-                loopCtx.observability?.recordToolResult(
-                    toolSpanId, toolUse.name, false,
-                    typeof result.content === "string" ? result.content : JSON.stringify(result.content),
-                );
-            } catch (error) {
-                const err = error instanceof Error ? error : new Error(String(error));
-                let errorMessage = `工具执行失败: ${err.message}`;
-
-                if (loopCtx.errorRecoveryManager) {
-                    const recovery = loopCtx.errorRecoveryManager.handleToolError(err, toolUse.name);
-
-                    if (recovery.strategy === RecoveryStrategy.CIRCUIT_BREAK) {
-                        yield {
-                            type: "error",
-                            error: new Error(recovery.error ?? "工具熔断保护触发"),
-                            category: ErrorCategory.CIRCUIT_BREAKER,
-                        };
-                        this.setState(AgentState.ERROR, "工具熔断保护触发");
-                        return { abort: true, toolResults };
-                    }
-                    errorMessage = recovery.error ?? errorMessage;
-                }
-
-                const errorResult: ToolResult = {
-                    tool_use_id: toolUse.id,
-                    content: errorMessage,
-                    is_error: true,
-                };
-                toolResults.push(errorResult);
-                this.consecutiveErrors++;
-                yield { type: "tool_result", result: errorResult };
-                loopCtx.observability?.recordToolResult(
-                    toolSpanId, toolUse.name, true, errorMessage,
-                );
-            }
+        if (result.abort) {
+            this.setState(AgentState.ERROR, "工具熔断保护触发");
         }
-
-        return { abort: false, toolResults };
+        return { abort: result.abort, toolResults: result.toolResults };
     }
 
     // ─── Phase 3: Finalize ───
@@ -689,7 +555,8 @@ export class AgentLoop {
         loopCtx: AgentLoopContext,
         source: string,
     ): AsyncGenerator<TurnEvent, "continue" | "abort"> {
-        if (!loopCtx.errorRecoveryManager) {
+        const erManager = (loopCtx.services?.errorRecovery ?? loopCtx.errorRecoveryManager);
+        if (!erManager) {
             yield { type: "error", error: new Error(`${source}: ${error.message}`) };
             this.setState(AgentState.ERROR, "无可用的错误恢复管理器");
             return "abort";
@@ -712,10 +579,10 @@ export class AgentLoop {
             return "abort";
         }
 
-        const recovery = loopCtx.errorRecoveryManager.handleLLMError(error, config.model);
+        const recovery = erManager.handleLLMError(error, config.model);
 
         if (recovery.action === "retry" && recovery.success) {
-            loopCtx.observability?.recordRecovery(recovery.strategy, true);
+            (loopCtx.services?.observability ?? loopCtx.observability)?.recordRecovery(recovery.strategy, true);
             this.setState(AgentState.RECOVERING, `恢复中: ${recovery.strategy}`);
             yield {
                 type: "recovering",
@@ -727,7 +594,7 @@ export class AgentLoop {
                 (config as { provider: typeof config.provider }).provider = recovery.provider;
             }
             if (recovery.strategy === RecoveryStrategy.COMPACT_CONTEXT) {
-                this.messages = this.compactor.compact(this.messages, loopCtx.summarizer);
+                this.messages = this.compactor.compact(this.messages, (loopCtx.services?.summarizer ?? loopCtx.summarizer));
                 this.llmRecoveryCount = 0;
             }
             return "continue";
@@ -748,7 +615,7 @@ export class AgentLoop {
      *          这样可以把压缩的 token 成本从"错误恢复"变成"正常流程"。
      */
     private proactiveContextCheck(config: AgentConfig, loopCtx: AgentLoopContext): void {
-        const monitor = loopCtx.contextMonitor;
+        const monitor = (loopCtx.services?.contextMonitor ?? loopCtx.contextMonitor);
         if (!monitor) return;
 
         const status = monitor.getStatus();
@@ -757,7 +624,7 @@ export class AgentLoop {
             loopCtx.logger?.warn(
                 `[AgentLoop] 上下文使用率 ${status.usagePercent.toFixed(1)}%，触发主动压缩`,
             );
-            this.messages = this.compactor.compact(this.messages, loopCtx.summarizer);
+            this.messages = this.compactor.compact(this.messages, (loopCtx.services?.summarizer ?? loopCtx.summarizer));
         }
     }
 
@@ -904,34 +771,5 @@ export class AgentLoop {
         for (const msg of this.messages) messages.push(msg);
         messages.push({ role: "user", content: userInput });
         return messages;
-    }
-
-    /**
-     * 标记: findTool — 在已注册工具列表中按名称查找工具
-     *
-     * @param name - 工具名称
-     * @param tools - 已注册的 Tool 实例数组
-     * @returns 匹配的 Tool 实例或 undefined
-     */
-    private findTool(name: string, tools: Tool[]): Tool | undefined {
-        return tools.find((t) => t.name === name);
-    }
-
-    /**
-     * 标记: toolToLLMFormat — 将 Tool 实例转换为 LLM 的函数定义格式（LLMToolDefinition）
-     *
-     * @param tool - 内部 Tool 实例
-     * @returns LLM 兼容的工具定义对象
-     */
-    private toolToLLMFormat(tool: Tool) {
-        return {
-            name: tool.name,
-            description: tool.description,
-            input_schema: {
-                type: "object" as const,
-                properties: tool.parameters.properties as Record<string, unknown>,
-                required: tool.parameters.required,
-            },
-        };
     }
 }

@@ -167,7 +167,7 @@
         }
     },
     "scripts": {
-        "build": "tsup src/extension.ts --format cjs --external vscode --clean",
+        "build": "tsup src/extension.ts --format cjs --external vscode --external @y-claude-code/core --clean",
         "dev": "tsup src/extension.ts --format cjs --external vscode --watch",
         "typecheck": "tsc --noEmit"
     },
